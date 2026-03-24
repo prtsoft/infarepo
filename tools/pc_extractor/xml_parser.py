@@ -226,12 +226,12 @@ def _parse_mapping(
         inst_type = _attr(ie, "TYPE")  # SOURCE, TARGET, TRANSFORMATION
         is_reusable = _bool_attr(ie, "REUSABLE")
         inst_name = _attr(ie, "NAME")
-        trf_name = _attr(ie, "TRANSFORMATION")
+        trf_name = _attr(ie, "TRANSFORMATION_NAME") or _attr(ie, "TRANSFORMATION")
 
         m.instances.append(InstanceDef(
             name=inst_name,
             transformation_name=trf_name,
-            transformation_type=_attr(ie, "TRANSFORMATIONTYPE") or inst_type,
+            transformation_type=_attr(ie, "TRANSFORMATION_TYPE") or _attr(ie, "TRANSFORMATIONTYPE") or inst_type,
             reusable=is_reusable,
         ))
 
@@ -245,8 +245,6 @@ def _parse_mapping(
             if resolved is not None and inst_name not in inline_names:
                 # Make a shallow copy so per-instance mutations don't affect the
                 # shared definition; set name to the instance name for lookups.
-                import copy as _copy
-                inst_trf = _copy.copy(resolved)
                 inst_trf = TransformationDef(
                     name=inst_name,
                     type=resolved.type,
@@ -364,7 +362,7 @@ def _parse_workflow(elem, folder_name: str) -> WorkflowDef:
             schedule_type=_attr(si, "SCHEDULETYPE"),
             start_time=_attr(si, "STARTTIME"),
             end_time=_attr(si, "ENDTIME"),
-            raw_attributes={si.attrib[k]: v for k, v in si.attrib.items()},
+            raw_attributes=dict(si.attrib),
         )
 
     # --- Tasks embedded in workflow (TASK elements) ---

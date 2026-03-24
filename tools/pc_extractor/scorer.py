@@ -72,7 +72,7 @@ def _is_databricks_target(mapping: MappingDef, folder_targets) -> bool:
 def score_mapping(
     mapping: MappingDef,
     folder_targets: dict,
-) -> Tuple[int, List[str], TargetPlatform]:
+) -> Tuple[int, List[str], TargetPlatform, List[str]]:
     """
     Compute (score, reasons, platform) for a single mapping.
     Does NOT mutate the mapping — caller applies the results.

@@ -127,7 +127,10 @@ class GlueScriptBuilder:
         if self._imports:
             extra_imports = "\n" + "\n".join(self._imports)
 
-        args_list = ",\n    ".join(f"'{a}'" for a in self._args)
+        if self._args:
+            args_block = "    'JOB_NAME',\n    " + ",\n    ".join(f"'{a}'" for a in self._args) + ","
+        else:
+            args_block = "    'JOB_NAME',"
 
         body = "\n".join(self._body)
 
@@ -160,8 +163,7 @@ logger.setLevel(logging.INFO)
 
 # --- Job parameters ---
 args = getResolvedOptions(sys.argv, [
-    'JOB_NAME',
-    {args_list},
+{args_block}
 ])
 
 sc = SparkContext()
@@ -303,7 +305,6 @@ class GlueJobCodeBuilder:
         s = self.script
         conn_arg = _arg_name(f"CONN_{src_name}")
         s.add_arg(conn_arg)
-        conn_type = _glue_conn_type(db_type)
         table_ref = f"{owner}{src_name}"
 
         conn_var = f"_conn_{_safe_var(src_name)}"
@@ -710,21 +711,21 @@ class GlueJobCodeBuilder:
         has_reject  = "DD_REJECT"  in expr_upper
         has_iif     = "IIF("       in expr_upper or "IF(" in expr_upper
 
-        if not any([has_insert, has_update, has_delete, has_reject, has_iif]):
-            # Simple constant-only expression (e.g. just "DD_INSERT")
+        if not has_iif:
+            # Constant-only expression (e.g. "DD_INSERT", "DD_UPDATE")
             flag_val = "0"
-            if "DD_UPDATE" in expr_upper:
+            if has_update:
                 flag_val = "1"
-            elif "DD_DELETE" in expr_upper:
+            elif has_delete:
                 flag_val = "2"
-            elif "DD_REJECT" in expr_upper:
+            elif has_reject:
                 flag_val = "3"
             s.emit(f"{out_df} = {in_df}.withColumn('_update_flag', F.lit({flag_val}))")
         else:
             # Translate the PC IIF/DECODE expression to a PySpark CASE WHEN
             from .expr_translator import translate
             result = translate(strategy_expr)
-            if result.confidence.value == "LOW":
+            if result.confidence == Confidence.LOW:
                 s.warn(
                     f"Low-confidence translation of Update Strategy expression: {strategy_expr!r}"
                 )
@@ -925,7 +926,6 @@ class GlueJobCodeBuilder:
         s = self.script
         conn_arg = _arg_name(f"CONN_TGT_{tgt_name}")
         s.add_arg(conn_arg)
-        conn_type = _glue_conn_type(db_type)
         table_ref = f"{owner}{tgt_name}"
 
         conn_var = f"_conn_tgt_{_safe_var(tgt_name)}"

@@ -284,7 +284,9 @@ def _handle_lookup(
         return sources
 
     # INPUT/OUTPUT pass-through
-    return _handle_generic(ctx, trf, inst, fld, fld, depth, visited, chain)
+    pass_port = next((p for p in trf.ports if p.name == fld), None)
+    pass_expr = (pass_port.expression if pass_port else "") or ""
+    return _handle_generic(ctx, trf, inst, fld, pass_expr, depth, visited, chain)
 
 
 def _handle_router(
@@ -332,7 +334,8 @@ def _handle_normalizer(
         if sources:
             return sources
     # Fallback: name match
-    return _handle_generic(ctx, trf, inst, fld, fld, depth, visited, chain)
+    fallback_expr = (port.expression if port else "") or ""
+    return _handle_generic(ctx, trf, inst, fld, fallback_expr, depth, visited, chain)
 
 
 def _handle_union(

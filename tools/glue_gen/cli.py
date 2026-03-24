@@ -94,7 +94,6 @@ def generate_all_cmd(manifest_file, output_dir, folder_filter, include_review, p
       glue-gen generate-all output/migration-manifest.json --folder-filter SALES_MART
     """
     _setup_logging(verbose)
-    from pc_extractor.xml_parser import _compute_summary
     import json as _json
 
     click.echo(f"  Loading manifest: {manifest_file}")
@@ -444,8 +443,14 @@ def _load_manifest(data: dict):
     summary_d = data.get("summary", {})
     from pc_extractor.models import ExtractionSummary
     s_fields = ExtractionSummary.__dataclass_fields__
-    summary = ExtractionSummary(**{k: summary_d.get(k, v.default if v.default is not v.default_factory else [])  # type: ignore
-                                    for k, v in s_fields.items()})
+    import dataclasses as _dc
+    summary = ExtractionSummary(**{
+        k: summary_d.get(
+            k,
+            v.default_factory() if v.default_factory is not _dc.MISSING else v.default,
+        )
+        for k, v in s_fields.items()
+    })
 
     manifest = MigrationManifest(
         extracted_at=data.get("extracted_at", ""),

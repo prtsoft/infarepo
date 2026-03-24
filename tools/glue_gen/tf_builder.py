@@ -126,8 +126,9 @@ def build_terraform_job(
     worker_type = "G.1X" if score <= 6 else "G.2X"
 
     # Connections used (unique connection args that have a CONN_ prefix)
+    import re as _re
     connection_vars = [
-        f'var.connection_{_safe_var(a.replace("CONN_", "").replace("CONN_TGT_", "").replace("CONN_LKP_", ""))}'
+        f'var.connection_{_safe_var(_re.sub(r"^CONN_(TGT_|LKP_)?", "", a))}'
         for a in job_args if a.startswith("CONN_")
     ]
     connections_block = ""
