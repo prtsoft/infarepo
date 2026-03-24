@@ -365,6 +365,12 @@ def _parse_workflow(elem, folder_name: str) -> WorkflowDef:
             raw_attributes=dict(si.attrib),
         )
 
+    # --- Workflow-level parameters ($$VAR) ---
+    for wp in elem.findall("WORKFLOWPARAM"):
+        param_name = _attr(wp, "NAME")
+        if param_name:
+            wf.parameters[param_name] = _attr(wp, "DEFAULTVALUE")
+
     # --- Tasks embedded in workflow (TASK elements) ---
     task_by_name: Dict[str, WorkflowTaskDef] = {}
     for te in elem.findall("TASK"):
@@ -386,6 +392,28 @@ def _parse_workflow(elem, folder_name: str) -> WorkflowDef:
         if not t.mapping_ref:
             t.mapping_ref = _attr(te, "MAPPING") or None
 
+        # COMMAND tasks: extract shell script from TABLEATTRIBUTE / ATTRIBUTE children
+        if t.task_type.upper() == "COMMAND":
+            for attr_elem in list(te.findall("TABLEATTRIBUTE")) + list(te.findall("ATTRIBUTE")):
+                attr_name = _attr(attr_elem, "NAME") or _attr(attr_elem, "ATTRNAME")
+                attr_val = _attr(attr_elem, "VALUE")
+                if attr_name.lower() in ("shell command", "shell command line", "command", "script"):
+                    t.command_script = attr_val
+                    break
+
+        # Collect all $$VAR references from every attribute value in this task
+        import re as _re
+        _dd_pattern = _re.compile(r'\$\$[A-Za-z_][A-Za-z0-9_]*')
+        all_vals = [_attr(a, "VALUE") for a in list(te.findall("TABLEATTRIBUTE")) + list(te.findall("ATTRIBUTE"))]
+        if t.command_script:
+            all_vals.append(t.command_script)
+        seen_vars: list = []
+        for val in all_vals:
+            for var in _dd_pattern.findall(val):
+                if var not in seen_vars:
+                    seen_vars.append(var)
+        t.task_variables = seen_vars
+
         wf.tasks.append(t)
         task_by_name[t.name] = t
 
@@ -401,6 +429,8 @@ def _parse_workflow(elem, folder_name: str) -> WorkflowDef:
         task_name_ref = _attr(ti, "TASKNAME")
         if task_name_ref and task_name_ref in task_by_name:
             t.mapping_ref = task_by_name[task_name_ref].mapping_ref
+            t.command_script = task_by_name[task_name_ref].command_script
+            t.task_variables = list(task_by_name[task_name_ref].task_variables)
         wf.tasks.append(t)
 
     # --- Links ---
@@ -411,11 +441,13 @@ def _parse_workflow(elem, folder_name: str) -> WorkflowDef:
             condition=_attr(le, "CONDITION"),
         ))
 
-    # Collect unique mapping refs
+    # Collect unique mapping refs and set quick-access flags
     wf.mapping_refs = list({
         t.mapping_ref for t in wf.tasks
         if t.task_type.upper() == "SESSION" and t.mapping_ref
     })
+    wf.has_command_tasks = any(t.task_type.upper() == "COMMAND" for t in wf.tasks if t.is_enabled)
+    wf.has_event_wait = any("EVENT" in t.task_type.upper() for t in wf.tasks if t.is_enabled)
 
     return wf
 

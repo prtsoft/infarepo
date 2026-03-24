@@ -174,6 +174,10 @@ def generate_mapping(
                         log.warning("  [RUFF] %s", line)
         except FileNotFoundError:
             pass  # ruff not installed — skip silently
+
+        # --- Workflow pre/post-session task warnings ---
+        _add_workflow_warnings(mapping.name, folder, result)
+
     except Exception as exc:
         log.error("  [ERROR] %s / %s: %s", mapping.folder, mapping.name, exc)
         result.status = "ERROR"
@@ -197,6 +201,50 @@ def generate_mapping(
         result.warnings.append(f"Terraform generation failed: {exc}")
 
     return result
+
+
+def _add_workflow_warnings(
+    mapping_name: str,
+    folder: "FolderDef",
+    result: "MappingGenerationResult",
+) -> None:
+    """
+    Scan every workflow in the folder that references this mapping.
+    Append warnings for COMMAND tasks, EVENT-WAIT tasks, and path-hinting $$ parameters.
+    """
+    import re as _re
+    _path_hint = _re.compile(r"[/\\]|sftp|ftp|dir|path|file|src|tgt|archive", _re.IGNORECASE)
+
+    for wf in folder.workflows.values():
+        if mapping_name not in wf.mapping_refs:
+            continue
+
+        for task in wf.tasks:
+            if not task.is_enabled or task.task_type.upper() != "COMMAND":
+                continue
+            script_snippet = f" — script: {task.command_script[:100]}" if task.command_script else ""
+            var_note = f" (vars: {', '.join(task.task_variables)})" if task.task_variables else ""
+            result.warnings.append(
+                f"[workflow:{wf.name}] COMMAND task '{task.name}'{script_snippet}{var_note}. "
+                f"Migrate to Lambda/ECS/SSM step in Step Functions."
+            )
+
+        if wf.has_event_wait:
+            result.warnings.append(
+                f"[workflow:{wf.name}] EVENT-WAIT task detected (file-arrival pattern). "
+                f"Replace with EventBridge + S3 event trigger."
+            )
+
+        path_params = {
+            k: v for k, v in wf.parameters.items()
+            if _path_hint.search(k) or _path_hint.search(v)
+        }
+        if path_params:
+            param_str = ", ".join(f"{k}={v!r}" for k, v in path_params.items())
+            result.warnings.append(
+                f"[workflow:{wf.name}] Path/file-hinting $$ parameters: {param_str}. "
+                f"Review for SFTP/file-arrival dependency."
+            )
 
 
 def _extract_args_from_script(script_text: str) -> List[str]:

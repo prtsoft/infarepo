@@ -303,11 +303,13 @@ class GlueJobCodeBuilder:
         src_name: str, owner: str, df_var: str, db_type: str,
     ) -> None:
         s = self.script
-        conn_arg = _arg_name(f"CONN_{src_name}")
+        conn_key = (src_def.db_name if src_def and src_def.db_name else src_name)
+        conn_arg = _arg_name(f"CONN_{conn_key}")
         s.add_arg(conn_arg)
-        table_ref = f"{owner}{src_name}"
+        table_name = src_def.name if src_def else src_name
+        table_ref = f"{owner}{table_name}"
 
-        conn_var = f"_conn_{_safe_var(src_name)}"
+        conn_var = f"_conn_{_safe_var(conn_key)}"
         s.emit(f'{conn_var} = glueContext.extract_jdbc_conf(args["{conn_arg}"])')
         s.emit(f"{df_var} = (spark.read")
         s.emit(f'    .format("jdbc")')
@@ -598,7 +600,12 @@ class GlueJobCodeBuilder:
         self._node_output[node.instance_name] = out_df
 
         lkp_table = t.attributes.get("Lookup Table Name", "UNKNOWN_LOOKUP_TABLE")
-        lkp_conn_arg = _arg_name(f"CONN_LKP_{lkp_table}")
+        lkp_db = (
+            t.attributes.get("Lookup Database Name")
+            or t.attributes.get("Connection Information")
+            or lkp_table
+        )
+        lkp_conn_arg = _arg_name(f"CONN_LKP_{lkp_db}")
         s.add_arg(lkp_conn_arg)
 
         lkp_condition = t.lookup_condition or ""
@@ -924,11 +931,12 @@ class GlueJobCodeBuilder:
         tgt_name: str, owner: str, write_df: str, db_type: str,
     ) -> None:
         s = self.script
-        conn_arg = _arg_name(f"CONN_TGT_{tgt_name}")
+        conn_key = (tgt_def.db_name if tgt_def and tgt_def.db_name else tgt_name)
+        conn_arg = _arg_name(f"CONN_TGT_{conn_key}")
         s.add_arg(conn_arg)
         table_ref = f"{owner}{tgt_name}"
 
-        conn_var = f"_conn_tgt_{_safe_var(tgt_name)}"
+        conn_var = f"_conn_tgt_{_safe_var(conn_key)}"
         s.emit(f'{conn_var} = glueContext.extract_jdbc_conf(args["{conn_arg}"])')
         s.emit(f"({write_df}.write")
         s.emit(f'    .format("jdbc")')

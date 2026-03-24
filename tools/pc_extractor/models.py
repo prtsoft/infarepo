@@ -200,6 +200,8 @@ class WorkflowTaskDef:
     is_reusable: bool = False
     mapping_ref: Optional[str] = None   # populated for SESSION tasks
     description: str = ""
+    command_script: str = ""            # COMMAND task: shell command / script line
+    task_variables: List[str] = field(default_factory=list)  # $$VAR refs found in this task
 
 
 @dataclass
@@ -230,6 +232,11 @@ class WorkflowDef:
     links: List[WorkflowLinkDef] = field(default_factory=list)
     # Names of mappings referenced via SESSION tasks
     mapping_refs: List[str] = field(default_factory=list)
+    # Workflow-level parameters ($$VAR → default value)
+    parameters: Dict[str, str] = field(default_factory=dict)
+    # Quick-access flags for generation/scoring
+    has_command_tasks: bool = False   # pre/post-session COMMAND tasks present
+    has_event_wait: bool = False      # EVENT-WAIT tasks present (file-arrival pattern)
 
 
 @dataclass

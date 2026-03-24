@@ -123,9 +123,21 @@ def _build_task_state(
 
 def _build_pass_state(task: WorkflowTaskDef, next_state: Optional[str]) -> dict:
     """Stub Pass state for non-SESSION tasks."""
+    if task.task_type.upper() == "COMMAND":
+        # COMMAND tasks ran pre/post-session scripts in PC.
+        # Migrate to a Lambda invoke, ECS RunTask, or SSM RunCommand Task state.
+        script_snippet = (f": {task.command_script[:120]}" if task.command_script else "")
+        var_note = (f" Variables: {', '.join(task.task_variables)}." if task.task_variables else "")
+        comment = (
+            f"TODO: PC COMMAND task '{task.name}'{script_snippet}. "
+            f"Replace this Pass state with a Lambda/ECS/SSM Task state.{var_note}"
+        )
+    else:
+        comment = f"PC {task.task_type} task: {task.name} (stub — review manually)"
+
     state: dict = {
         "Type": "Pass",
-        "Comment": f"PC {task.task_type} task: {task.name} (stub — no action needed)",
+        "Comment": comment,
     }
     if next_state:
         state["Next"] = next_state
