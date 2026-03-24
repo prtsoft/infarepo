@@ -304,6 +304,22 @@ def report_cmd(report_file):
             print(f"  {r.get('status'):8}  {r.get('folder')}/{r.get('mapping')}")
 
 
+def _print_report(report) -> None:
+    """Print a brief generation report summary to stdout."""
+    click.echo(
+        f"  Generated: {report.generated}  "
+        f"Skipped: {report.skipped}  "
+        f"Errors: {report.errors}  "
+        f"Total: {report.total_mappings}"
+    )
+    for r in report.results:
+        status = r.status
+        detail = r.glue_script_path or r.error or ""
+        click.echo(f"  [{status:7}]  {r.folder}/{r.mapping}  {detail}")
+        for w in (r.warnings or []):
+            click.echo(f"            ! {w}")
+
+
 # ---------------------------------------------------------------------------
 # Manifest loader (reconstruct from JSON without full pc_extractor parse)
 # ---------------------------------------------------------------------------
