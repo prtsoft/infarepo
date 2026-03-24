@@ -150,6 +150,8 @@ class TargetDef:
     owner: str = ""
     description: str = ""
     fields: List[FieldDef] = field(default_factory=list)
+    # Flat file specific
+    delimiter: str = ""
 
 
 @dataclass

@@ -204,13 +204,20 @@ def build_step_functions(
         JSON string suitable for use as an asl_definition in Terraform or direct
         upload to Step Functions.
     """
-    tasks = workflow.tasks
-    links = workflow.links
     folder = workflow.folder
 
-    if not tasks:
+    # Filter to enabled tasks only; skip disabled PC tasks.
+    enabled_tasks = [t for t in workflow.tasks if t.is_enabled]
+    enabled_names: Set[str] = {t.name for t in enabled_tasks}
+    # Filter links to those between enabled tasks only.
+    links = [
+        lnk for lnk in workflow.links
+        if lnk.from_task in enabled_names and lnk.to_task in enabled_names
+    ]
+
+    if not enabled_tasks:
         return json.dumps({
-            "Comment": f"Empty workflow: {workflow.name}",
+            "Comment": f"Empty workflow (all tasks disabled): {workflow.name}",
             "StartAt": "NoOp",
             "States": {
                 "NoOp": {"Type": "Pass", "End": True}
@@ -218,7 +225,7 @@ def build_step_functions(
         }, indent=2)
 
     # Topological sort for state ordering
-    sorted_tasks = _topo_sort(tasks, links)
+    sorted_tasks = _topo_sort(enabled_tasks, links)
 
     states: Dict[str, dict] = {}
 
@@ -243,11 +250,76 @@ def build_step_functions(
     # Add failure handler
     states["HandleFailure"] = _build_failure_state()
 
-    start_task = sorted_tasks[0]
+    # Determine start state. If multiple tasks have no predecessors (parallel
+    # entry points), wrap them in a Parallel state so none are unreachable.
+    entry_tasks = [t for t in sorted_tasks if not _predecessors(t.name, links)]
+
+    if len(entry_tasks) > 1:
+        # Build one Branch per entry task. Each branch is a minimal state machine
+        # starting at that task and running until it has no further successors.
+        # Fan-in convergence is left for manual wiring (complex to detect statically).
+        branches = []
+        for et in entry_tasks:
+            branch_states: Dict[str, dict] = {}
+            # Walk this entry task's chain until a task with predecessors from
+            # outside this chain is reached (i.e., convergence point).
+            visited: Set[str] = set()
+            queue = [et.name]
+            while queue:
+                tname = queue.pop(0)
+                if tname in visited:
+                    continue
+                visited.add(tname)
+                # Deep-copy the state so we can mutate Next/End without affecting
+                # the original states dict (which is also written to the top-level).
+                import copy as _copy
+                branch_states[_state_name(tname)] = _copy.deepcopy(states[_state_name(tname)])
+                for lnk in links:
+                    if lnk.from_task == tname and lnk.to_task not in visited:
+                        # Only follow if this successor has no predecessors outside our branch
+                        other_preds = [
+                            p for p in _predecessors(lnk.to_task, links)
+                            if p not in visited
+                        ]
+                        if not other_preds:
+                            queue.append(lnk.to_task)
+
+            # Fix terminal states: any state whose `Next` points outside this branch
+            # must become an End state to produce valid ASL JSON.
+            branch_state_names = set(branch_states.keys())
+            for st_name, st_body in branch_states.items():
+                if "Next" in st_body and st_body["Next"] not in branch_state_names:
+                    st_body.pop("Next")
+                    st_body["End"] = True
+                # Choice states use Default / Choices[].Next — fix those too
+                if st_body.get("Type") == "Choice":
+                    if "Default" in st_body and st_body["Default"] not in branch_state_names:
+                        st_body["Default"] = "HandleFailure"
+                    if "Choices" in st_body:
+                        st_body["Choices"] = [
+                            c for c in st_body["Choices"]
+                            if c.get("Next") in branch_state_names
+                        ]
+
+            branch_start = _state_name(et.name)
+            branches.append({"StartAt": branch_start, "States": branch_states})
+
+        states["__ParallelEntryPoints"] = {
+            "Type": "Parallel",
+            "Comment": (
+                "TODO: PC workflow has multiple independent entry tasks — "
+                "verify branch boundaries and add convergence logic after this state."
+            ),
+            "Branches": branches,
+            "End": True,
+        }
+        start_at = "__ParallelEntryPoints"
+    else:
+        start_at = _state_name(sorted_tasks[0].name)
 
     sm: dict = {
         "Comment": f"Migrated workflow: {workflow.name} (folder: {folder})",
-        "StartAt": _state_name(start_task.name),
+        "StartAt": start_at,
         "States": states,
     }
 

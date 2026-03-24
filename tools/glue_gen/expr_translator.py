@@ -63,8 +63,9 @@ _TOKEN_MAP = {
     r"\bTRUE\b":              "True",
     r"\bFALSE\b":             "False",
     r"\bSPACES\b":            '" "',
-    r"\|\|":                  " + ",        # string concat operator
     r"\s*<>\s*":              " != ",       # SQL not-equal
+    # Note: || (string concat) is handled in translate() via _concat_pipes(),
+    # NOT here, because F.concat() requires argument splitting not simple regex.
 }
 
 # ---------------------------------------------------------------------------
@@ -73,41 +74,45 @@ _TOKEN_MAP = {
 # Applied in order — order matters for nested calls.
 # ---------------------------------------------------------------------------
 
-def _iif(m: re.Match) -> str:
-    cond, true_val, false_val = m.group(1), m.group(2), m.group(3)
-    return f"F.when({_translate_inner(cond)}, {_translate_inner(true_val)}).otherwise({_translate_inner(false_val)})"
+def _iif_handler(args: List[str], raw: str) -> str:
+    """IIF(cond, true_val, false_val) — nested-safe via _sub_func."""
+    if len(args) < 3:
+        return f"F.lit(None)  # TODO: IIF({raw}) — insufficient args"
+    return f"F.when({_translate_inner(args[0])}, {_translate_inner(args[1])}).otherwise({_translate_inner(args[2])})"
 
 
-def _nvl(m: re.Match) -> str:
-    a, b = m.group(1), m.group(2)
-    return f"F.coalesce({_translate_inner(a)}, {_translate_inner(b)})"
+def _nvl_handler(args: List[str], raw: str) -> str:
+    """NVL(a, b) — nested-safe via _sub_func."""
+    if len(args) < 2:
+        return f"F.lit(None)  # TODO: NVL({raw}) — insufficient args"
+    return f"F.coalesce({_translate_inner(args[0])}, {_translate_inner(args[1])})"
 
 
-def _nvl2(m: re.Match) -> str:
-    expr, not_null, is_null = m.group(1), m.group(2), m.group(3)
+def _nvl2_handler(args: List[str], raw: str) -> str:
+    """NVL2(expr, not_null_val, null_val) — nested-safe via _sub_func."""
+    if len(args) < 3:
+        return f"F.lit(None)  # TODO: NVL2({raw}) — insufficient args"
     return (
-        f"F.when({_translate_inner(expr)}.isNotNull(), {_translate_inner(not_null)})"
-        f".otherwise({_translate_inner(is_null)})"
+        f"F.when({_translate_inner(args[0])}.isNotNull(), {_translate_inner(args[1])})"
+        f".otherwise({_translate_inner(args[2])})"
     )
 
 
-def _decode(m: re.Match) -> str:
-    """DECODE(col, val1, res1, val2, res2, ..., default) → chained when/otherwise"""
-    raw = m.group(1)
-    parts = _split_args(raw)
-    if len(parts) < 3:
-        return f"# TODO: DECODE({raw})  -- translate manually"
-    col_expr = _translate_inner(parts[0])
+def _decode_handler(args: List[str], raw: str) -> str:
+    """DECODE(col, val1, res1, val2, res2, ..., default) — nested-safe via _sub_func."""
+    if len(args) < 3:
+        return f"F.lit(None)  # TODO: DECODE({raw}) — translate manually (insufficient args)"
+    col_expr = _translate_inner(args[0])
     chains = []
     i = 1
-    while i + 1 < len(parts):
-        val = _translate_inner(parts[i])
-        res = _translate_inner(parts[i+1])
+    while i + 1 < len(args):
+        val = _translate_inner(args[i])
+        res = _translate_inner(args[i + 1])
         chains.append(f"F.when({col_expr} == {val}, {res})")
         i += 2
     result = ".".join(chains)
-    if i < len(parts):          # default value present
-        result += f".otherwise({_translate_inner(parts[i])})"
+    if i < len(args):
+        result += f".otherwise({_translate_inner(args[i])})"
     else:
         result += ".otherwise(None)"
     return result
@@ -126,23 +131,10 @@ def _not_in_list(m: re.Match) -> str:
 
 
 # Patterns: (compiled_regex, replacement_fn_or_str, confidence_on_match)
+# NOTE: IIF, NVL, NVL2, DECODE are handled in translate() via _sub_func() which
+# uses _split_args() for balanced-paren-aware argument splitting. They are NOT
+# in this list because lazy regex (.+?) breaks on nested function calls.
 _FUNC_PATTERNS: list = [
-    # IIF(condition, true_val, false_val)
-    (re.compile(r"\bIIF\s*\((.+?),\s*(.+?),\s*(.+?)\)", re.IGNORECASE | re.DOTALL),
-     _iif, Confidence.HIGH),
-
-    # NVL(a, b)
-    (re.compile(r"\bNVL\s*\((.+?),\s*(.+?)\)", re.IGNORECASE | re.DOTALL),
-     _nvl, Confidence.HIGH),
-
-    # NVL2(expr, not_null_val, null_val)
-    (re.compile(r"\bNVL2\s*\((.+?),\s*(.+?),\s*(.+?)\)", re.IGNORECASE | re.DOTALL),
-     _nvl2, Confidence.HIGH),
-
-    # DECODE(col, v1, r1, ...)
-    (re.compile(r"\bDECODE\s*\((.+?)\)", re.IGNORECASE | re.DOTALL),
-     _decode, Confidence.MEDIUM),
-
     # IN(col, v1, v2, ...)  — PC uses IN() as function not SQL IN keyword
     (re.compile(r"\bIN\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
      _in_list, Confidence.HIGH),
@@ -301,6 +293,95 @@ _FUNC_PATTERNS: list = [
     (re.compile(r"\bABORT\s*\(\s*(.+?)\s*\)", re.IGNORECASE),
      lambda m: f"# TODO: ABORT({m.group(1)}) — handle error routing manually",
      Confidence.LOW),
+
+    # -----------------------------------------------------------------------
+    # String search / replace functions
+    # -----------------------------------------------------------------------
+
+    # INSTR(str, search, start, occurrence) — various arities
+    (re.compile(r"\bINSTR\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: (
+         f"F.locate({_translate_inner(m.group(2))}, {_wrap_col(m.group(1))}, "
+         f"{_translate_inner(m.group(3))})"
+     ),
+     Confidence.MEDIUM),  # occurrence arg ignored — no direct Spark equivalent
+
+    # INSTR(str, search, start)
+    (re.compile(r"\bINSTR\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"F.locate({_translate_inner(m.group(2))}, {_wrap_col(m.group(1))}, {_translate_inner(m.group(3))})",
+     Confidence.HIGH),
+
+    # INSTR(str, search)
+    (re.compile(r"\bINSTR\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"F.locate({_translate_inner(m.group(2))}, {_wrap_col(m.group(1))})",
+     Confidence.HIGH),
+
+    # REPLACECHR(case_flag, str, old_chars, new_char) → F.translate()
+    # PC REPLACECHR replaces individual characters; F.translate is the direct equivalent.
+    # case_flag (0=case-sensitive, 1=case-insensitive) is not supported by F.translate.
+    (re.compile(r"\bREPLACECHR\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"F.translate({_wrap_col(m.group(2))}, {_translate_inner(m.group(3))}, {_translate_inner(m.group(4))})",
+     Confidence.MEDIUM),  # case_flag ignored
+
+    # REPLACESTR(case_flag, str, old_str, new_str) → F.regexp_replace()
+    (re.compile(r"\bREPLACESTR\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"F.regexp_replace({_wrap_col(m.group(2))}, {_translate_inner(m.group(3))}, {_translate_inner(m.group(4))})",
+     Confidence.MEDIUM),  # case_flag ignored; old_str treated as literal pattern
+
+    # INITCAP
+    (re.compile(r"\bINITCAP\s*\(\s*(.+?)\s*\)", re.IGNORECASE),
+     lambda m: f"F.initcap({_wrap_col(m.group(1))})", Confidence.HIGH),
+
+    # CHR(n) / ASCII(str)
+    (re.compile(r"\bCHR\s*\(\s*(.+?)\s*\)", re.IGNORECASE),
+     lambda m: f"F.chr({_translate_inner(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bASCII\s*\(\s*(.+?)\s*\)", re.IGNORECASE),
+     lambda m: f"F.ascii({_wrap_col(m.group(1))})", Confidence.HIGH),
+
+    # -----------------------------------------------------------------------
+    # Date part extraction: GET_DATE_PART(date, 'unit')
+    # -----------------------------------------------------------------------
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'(YYYY|YY|Y)'\s*\)", re.IGNORECASE),
+     lambda m: f"F.year({_wrap_col(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'MM'\s*\)", re.IGNORECASE),
+     lambda m: f"F.month({_wrap_col(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'DD'\s*\)", re.IGNORECASE),
+     lambda m: f"F.dayofmonth({_wrap_col(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'HH24'\s*\)", re.IGNORECASE),
+     lambda m: f"F.hour({_wrap_col(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'MI'\s*\)", re.IGNORECASE),
+     lambda m: f"F.minute({_wrap_col(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'SS'\s*\)", re.IGNORECASE),
+     lambda m: f"F.second({_wrap_col(m.group(1))})", Confidence.HIGH),
+    (re.compile(r"\bGET_DATE_PART\s*\(\s*(.+?)\s*,\s*'[^']+'\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"F.date_format({_wrap_col(m.group(1))}, '<TODO: map PC unit>')  # GET_DATE_PART unit not mapped",
+     Confidence.LOW),  # catch-all for unmapped units
+
+    # -----------------------------------------------------------------------
+    # Regex functions
+    # -----------------------------------------------------------------------
+    # REG_EXTRACT(str, pattern, index)
+    (re.compile(r"\bREG_EXTRACT\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(\d+)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"F.regexp_extract({_wrap_col(m.group(1))}, {_translate_inner(m.group(2))}, {m.group(3)})",
+     Confidence.HIGH),
+
+    # REG_MATCH(str, pattern) → rlike (returns boolean column)
+    (re.compile(r"\bREG_MATCH\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE | re.DOTALL),
+     lambda m: f"{_wrap_col(m.group(1))}.rlike({_translate_inner(m.group(2))})",
+     Confidence.HIGH),
+
+    # -----------------------------------------------------------------------
+    # Additional ADD_TO_DATE units not previously covered (HH, MI, SS)
+    # -----------------------------------------------------------------------
+    (re.compile(r"\bADD_TO_DATE\s*\(\s*(.+?)\s*,\s*'HH(?:24)?'\s*,\s*(.+?)\s*\)", re.IGNORECASE),
+     lambda m: f"({_wrap_col(m.group(1))} + F.expr(f'INTERVAL {{{_translate_inner(m.group(2))}}} HOURS'))",
+     Confidence.MEDIUM),
+    (re.compile(r"\bADD_TO_DATE\s*\(\s*(.+?)\s*,\s*'MI'\s*,\s*(.+?)\s*\)", re.IGNORECASE),
+     lambda m: f"({_wrap_col(m.group(1))} + F.expr(f'INTERVAL {{{_translate_inner(m.group(2))}}} MINUTES'))",
+     Confidence.MEDIUM),
+    (re.compile(r"\bADD_TO_DATE\s*\(\s*(.+?)\s*,\s*'SS'\s*,\s*(.+?)\s*\)", re.IGNORECASE),
+     lambda m: f"({_wrap_col(m.group(1))} + F.expr(f'INTERVAL {{{_translate_inner(m.group(2))}}} SECONDS'))",
+     Confidence.MEDIUM),
 ]
 
 # ---------------------------------------------------------------------------
@@ -371,9 +452,103 @@ def _split_args(s: str) -> List[str]:
     return args
 
 
+def _sub_func(func_name: str, expr: str, handler) -> str:
+    """
+    Replace all occurrences of func_name(...) in expr using balanced-paren-aware
+    argument parsing. Correctly handles nested function calls where lazy regex fails.
+
+    handler: callable(args: List[str], raw_inner: str) -> str
+    """
+    pat = re.compile(r'\b' + re.escape(func_name) + r'\s*\(', re.IGNORECASE)
+    result = []
+    pos = 0
+    for m in pat.finditer(expr):
+        result.append(expr[pos:m.start()])
+        start = m.end()
+        depth = 1
+        i = start
+        in_quote = False
+        quote_char = None
+        while i < len(expr) and depth > 0:
+            ch = expr[i]
+            if in_quote:
+                if ch == quote_char:
+                    in_quote = False
+            elif ch in ('"', "'"):
+                in_quote = True
+                quote_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            i += 1
+        inner = expr[start:i - 1]
+        args = _split_args(inner)
+        result.append(handler(args, inner))
+        pos = i
+    result.append(expr[pos:])
+    return ''.join(result)
+
+
 def _translate_inner(expr: str) -> str:
     """Translate without creating a TranslationResult (used for nested calls)."""
     return translate(expr.strip()).pyspark_expr
+
+
+def _concat_pipes(expr: str) -> str:
+    """
+    Replace PC string concatenation operator || with F.concat(...).
+
+    PC: A || B || C  →  F.concat(A, B, C)
+
+    Splits on top-level || (respects nested parentheses and quotes) and wraps
+    each operand in F.concat(). Using F.concat() instead of + avoids the
+    arithmetic-vs-concat ambiguity when operands are numeric columns.
+    """
+    if "||" not in expr:
+        return expr
+
+    # Split on top-level || tokens
+    parts = []
+    current: list = []
+    depth = 0
+    in_quote = False
+    quote_char = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if in_quote:
+            current.append(ch)
+            if ch == quote_char:
+                in_quote = False
+        elif ch in ('"', "'"):
+            in_quote = True
+            quote_char = ch
+            current.append(ch)
+        elif ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == "|" and depth == 0 and i + 1 < len(expr) and expr[i + 1] == "|":
+            parts.append("".join(current).strip())
+            current = []
+            i += 2  # skip both |
+            continue
+        else:
+            current.append(ch)
+        i += 1
+
+    if current:
+        parts.append("".join(current).strip())
+
+    if len(parts) <= 1:
+        # No top-level || found — return unchanged
+        return expr
+
+    translated_parts = ", ".join(_translate_inner(p) for p in parts)
+    return f"F.concat({translated_parts})"
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +566,17 @@ def translate(expr: str) -> TranslationResult:
 
     result = TranslationResult(expr.strip())
     log.debug("Translating PC expression (length=%d)", len(expr))
+
+    # 0. Pre-process || string concatenation → F.concat() before token/function passes
+    result.pyspark_expr = _concat_pipes(result.pyspark_expr)
+
+    # 0a. Translate nested-capable functions with balanced-paren arg splitting.
+    # Applied before the regex pass so inner args are correctly bounded regardless
+    # of nesting depth. NVL2 before NVL to avoid the NVL prefix matching NVL2.
+    result.pyspark_expr = _sub_func("IIF",    result.pyspark_expr, _iif_handler)
+    result.pyspark_expr = _sub_func("NVL2",   result.pyspark_expr, _nvl2_handler)
+    result.pyspark_expr = _sub_func("NVL",    result.pyspark_expr, _nvl_handler)
+    result.pyspark_expr = _sub_func("DECODE", result.pyspark_expr, _decode_handler)
 
     # 1. Token replacements
     for pattern, replacement in _TOKEN_MAP.items():
@@ -460,6 +646,10 @@ _KNOWN_TRANSLATED = {
     "current_date", "coalesce", "sum", "count", "avg", "min", "max",
     "first", "last", "percentile_approx", "monotonically_increasing_id",
     "date_sub", "int", "long", "double", "decimal", "string",
+    # Added for new function translations
+    "locate", "translate", "regexp_replace", "regexp_extract", "rlike",
+    "initcap", "chr", "ascii", "year", "month", "dayofmonth", "hour",
+    "minute", "second", "expr",
 }
 
 
@@ -491,6 +681,10 @@ def translate_filter(condition: str) -> TranslationResult:
         return TranslationResult("True")
 
     cond = condition.strip()
+
+    # Translate IS NOT NULL / IS NULL before touching NOT (avoids IS ~ NULL corruption)
+    cond = re.sub(r"\bIS\s+NOT\s+NULL\b", ".isNotNull()", cond, flags=re.IGNORECASE)
+    cond = re.sub(r"\bIS\s+NULL\b",       ".isNull()",    cond, flags=re.IGNORECASE)
 
     # Normalize SQL AND/OR to Python & / |
     cond = re.sub(r"\bAND\b", "&", cond, flags=re.IGNORECASE)
@@ -531,10 +725,10 @@ def translate_join_condition(condition: str) -> TranslationResult:
         left, right = equi.group(1), equi.group(2)
         if left == right:
             return TranslationResult(f'"{left}"')
-        # Different column names — use explicit expression
+        # Different column names — use explicit column expression
         return TranslationResult(
-            f'F.col("left.{left}") == F.col("right.{right}")',
-            notes=["Renamed join columns — verify table aliases are correct"]
+            f'F.col("{left}") == F.col("{right}")',
+            notes=["Renamed join columns — if both DataFrames share column names, alias them before the join"]
         )
 
     # Multi-column equi-join: A = A AND B = B

@@ -106,6 +106,11 @@ def _parse_target(elem) -> TargetDef:
         owner=_attr(elem, "OWNERNAME"),
         description=_attr(elem, "DESCRIPTION"),
     )
+    # Flat file delimiter stored in TABLEATTRIBUTE elements
+    for ta in elem.findall("TABLEATTRIBUTE"):
+        if _attr(ta, "NAME") in ("Delimiter", "Column Delimiter", "Field Delimiter"):
+            tgt.delimiter = _attr(ta, "VALUE")
+            break
     for f in elem.findall("TARGETFIELD"):
         tgt.fields.append(FieldDef(
             name=_attr(f, "NAME"),

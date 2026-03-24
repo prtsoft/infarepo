@@ -25,7 +25,7 @@ at INFO level but values only at DEBUG (which should be disabled in prod).
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from pc_extractor.models import (
     FolderDef, MappingDef, SourceDef, TargetDef, TransformationDef,
@@ -200,6 +200,9 @@ class GlueJobCodeBuilder:
         self.script = GlueScriptBuilder(mapping.name, mapping.folder)
         # Track which df var name each node produces
         self._node_output: Dict[str, str] = {}
+        # Router group wiring: downstream_instance_name → correct group df var
+        # Populated by _build_router so each successor gets the right group DataFrame.
+        self._node_group_wiring: Dict[str, str] = {}
 
     def build(self) -> Tuple[str, List[str]]:
         """
@@ -235,6 +238,16 @@ class GlueJobCodeBuilder:
         score = self.mapping.complexity_score or 1
         platform = self.mapping.target_platform.value if self.mapping.target_platform else "GLUE"
         return s.render(score, platform), self.script._warnings
+
+    def _resolve_in_df(self, node_name: str, upstream: Optional[str]) -> str:
+        """
+        Resolve the input DataFrame variable for a node.
+        Checks Router group wiring first (so nodes downstream of a Router
+        get the correct group DataFrame, not always the first group).
+        """
+        if node_name in self._node_group_wiring:
+            return self._node_group_wiring[node_name]
+        return self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
 
     # ------------------------------------------------------------------
     # Source Qualifier
@@ -276,9 +289,9 @@ class GlueJobCodeBuilder:
         elif _is_lakehouse(db_type):
             self._build_lakehouse_source(node, src_def, df_var)
         else:
-            self._build_jdbc_source(node, src_def, src_name, owner, df_var, db_type)
+            self._build_jdbc_source(node, src_def, src_name, owner, df_var, db_type, sq_def=t)
 
-        # Apply source filter if present
+        # Apply source filter if present (SQ filter condition, not SQL override)
         if t and t.filter_condition:
             filt = translate_filter(t.filter_condition)
             if filt.confidence == Confidence.LOW:
@@ -287,20 +300,10 @@ class GlueJobCodeBuilder:
             s.emit(f"# Source filter: {t.filter_condition}")
             s.emit(f"{df_var} = {df_var}.filter({filt.pyspark_expr})")
 
-        # Apply SQL override comment
-        if t and t.sql_query:
-            s.emit("")
-            s.emit(f"# NOTE: Original PC mapping used a SQL override on {node.instance_name}.")
-            s.emit(f"# The query below is the original — the JDBC read above reads the full")
-            s.emit(f"# table; add .filter()/.select() calls to replicate the SQL logic.")
-            s.emit(f"# Original SQL:")
-            for line in t.sql_query.splitlines():
-                s.emit(f"#   {line}")
-            s.warn(f"SQL override on {node.instance_name} — incorporate query logic into filter/select")
-
     def _build_jdbc_source(
         self, node: PipelineNode, src_def: Optional[SourceDef],
         src_name: str, owner: str, df_var: str, db_type: str,
+        sq_def: Optional[TransformationDef] = None,
     ) -> None:
         s = self.script
         conn_key = (src_def.db_name if src_def and src_def.db_name else src_name)
@@ -309,12 +312,20 @@ class GlueJobCodeBuilder:
         table_name = src_def.name if src_def else src_name
         table_ref = f"{owner}{table_name}"
 
+        # Use SQL override as a JDBC subquery when present — avoids full table scan.
+        if sq_def and sq_def.sql_query:
+            alias = f"pc_sq_{_safe_var(src_name)}"
+            dbtable = f"({sq_def.sql_query}) AS {alias}"
+            s.emit(f"# SQL override from PC Source Qualifier — executed as JDBC subquery")
+        else:
+            dbtable = table_ref
+
         conn_var = f"_conn_{_safe_var(conn_key)}"
         s.emit(f'{conn_var} = glueContext.extract_jdbc_conf(args["{conn_arg}"])')
         s.emit(f"{df_var} = (spark.read")
         s.emit(f'    .format("jdbc")')
         s.emit(f'    .option("url", {conn_var}["url"])')
-        s.emit(f'    .option("dbtable", "{table_ref}")')
+        s.emit(f'    .option("dbtable", "{dbtable}")')
         s.emit(f'    .option("user", {conn_var}["user"])')
         s.emit(f'    .option("password", {conn_var}["password"])')
         s.emit(f"    .load()")
@@ -324,10 +335,12 @@ class GlueJobCodeBuilder:
         self, node: PipelineNode, src_def: Optional[SourceDef], df_var: str
     ) -> None:
         s = self.script
-        s.add_arg("S3_INPUT_PATH")
+        src_safe = _safe_var(src_def.name if src_def else node.transformation_name)
+        path_arg = _arg_name(f"S3_INPUT_PATH_{src_safe}")
+        s.add_arg(path_arg)
 
         if src_def and src_def.is_fixed_width:
-            self._build_fixed_width_source(node, src_def, df_var)
+            self._build_fixed_width_source(node, src_def, df_var, path_arg)
         else:
             delim = src_def.delimiter if (src_def and src_def.delimiter) else ","
             s.emit(f"{df_var} = spark.read \\")
@@ -340,18 +353,17 @@ class GlueJobCodeBuilder:
                 for sl in schema_lines:
                     s.emit(f"        {sl}")
                 s.emit(f"    ])) \\")
-            s.emit(f'    .csv(args["S3_INPUT_PATH"])')
+            s.emit(f'    .csv(args["{path_arg}"])')
 
     def _build_fixed_width_source(
-        self, node: PipelineNode, src_def: SourceDef, df_var: str
+        self, node: PipelineNode, src_def: SourceDef, df_var: str, path_arg: str
     ) -> None:
         s = self.script
-        s.add_import("import re as _re")
         s.emit(f"# Fixed-width file — reading as text then splitting by position")
 
         if not src_def.fields:
             s.warn(f"Fixed-width source {src_def.name} has no field definitions — cannot determine column positions")
-            s.emit(f"{df_var} = spark.read.text(args['S3_INPUT_PATH'])")
+            s.emit(f'{df_var} = spark.read.text(args["{path_arg}"])')
             return
 
         # Generate field position parsing code
@@ -359,30 +371,49 @@ class GlueJobCodeBuilder:
         positions: List[Tuple[str, int, int]] = []
         pos = 0
         for f in src_def.fields:
-            length = f.length or f.precision or 10
+            length = f.length or f.precision
+            if not length:
+                s.warn(
+                    f"Fixed-width field '{f.name}' in source '{src_def.name}' has no "
+                    "length/precision — defaulting to 1; verify source layout"
+                )
+                length = 1
             positions.append((f.name, pos, pos + length))
             pos += length
 
-        s.emit(f"_raw_{_safe_var(src_def.name)} = spark.read.text(args['S3_INPUT_PATH'])")
-        s.emit(f"{df_var} = _raw_{_safe_var(src_def.name)}.select(")
+        raw_var = f"_raw_{_safe_var(src_def.name)}"
+        s.emit(f'{raw_var} = spark.read.text(args["{path_arg}"])')
+        s.emit(f"{df_var} = {raw_var}.select(")
         for fname, start, end in positions:
             s.emit(f'    F.substring(F.col("value"), {start + 1}, {end - start}).alias("{fname}"),')
         s.emit(f")")
+
+        # Trim space-padding from CHAR/VARCHAR columns (fixed-width convention)
+        str_fields = [
+            f.name for f in src_def.fields
+            if f.datatype.lower() in ("char", "nchar", "varchar", "nvarchar", "string")
+        ]
+        if str_fields:
+            s.emit(f"# Trim space-padding from fixed-width CHAR columns")
+            for fname in str_fields:
+                s.emit(f'{df_var} = {df_var}.withColumn("{fname}", F.trim(F.col("{fname}")))')
 
     def _build_excel_source(
         self, node: PipelineNode, src_def: Optional[SourceDef], df_var: str
     ) -> None:
         s = self.script
         s.add_import("import pandas as _pd")
-        s.add_arg("S3_INPUT_PATH")
-        s.add_arg("EXCEL_SHEET_NAME")
         src_name = src_def.name if src_def else node.transformation_name
+        path_arg = _arg_name(f"S3_INPUT_PATH_{_safe_var(src_name)}")
+        sheet_arg = _arg_name(f"EXCEL_SHEET_{_safe_var(src_name)}")
+        s.add_arg(path_arg)
+        s.add_arg(sheet_arg)
 
         s.emit(f"# Excel source — read via pandas then convert to Spark DataFrame")
         s.emit(f"# NOTE: For large Excel files consider converting to CSV/Parquet upstream")
         s.emit(f"_pdf_{_safe_var(src_name)} = _pd.read_excel(")
-        s.emit(f'    args["S3_INPUT_PATH"],')
-        s.emit(f'    sheet_name=args["EXCEL_SHEET_NAME"],')
+        s.emit(f'    args["{path_arg}"],')
+        s.emit(f'    sheet_name=args["{sheet_arg}"],')
         s.emit(f"    dtype=str,   # read all as string, cast below")
         s.emit(f")")
         s.emit(f"{df_var} = spark.createDataFrame(_pdf_{_safe_var(src_name)})")
@@ -391,10 +422,12 @@ class GlueJobCodeBuilder:
         self, node: PipelineNode, src_def: Optional[SourceDef], df_var: str
     ) -> None:
         s = self.script
-        s.add_arg("S3_INPUT_PATH")
+        src_safe = _safe_var(src_def.name if src_def else node.transformation_name)
+        path_arg = _arg_name(f"S3_INPUT_PATH_{src_safe}")
+        s.add_arg(path_arg)
         db_type = src_def.db_type.lower() if src_def else "parquet"
         fmt = "delta" if "delta" in db_type else "parquet"
-        s.emit(f'{df_var} = spark.read.format("{fmt}").load(args["S3_INPUT_PATH"])')
+        s.emit(f'{df_var} = spark.read.format("{fmt}").load(args["{path_arg}"])')
 
     def _build_schema(self, src_def: SourceDef) -> List[str]:
         """Generate StructType field lines for a source definition."""
@@ -433,7 +466,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -468,7 +501,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -492,7 +525,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -587,6 +620,23 @@ class GlueJobCodeBuilder:
         s.emit(f'    how="{spark_join_type}",')
         s.emit(f")")
 
+        # Spark deduplicates the join key automatically when `on` is a column name
+        # string or list (same-name equi-join). For expression-form joins and any
+        # non-key columns shared by both DataFrames, ambiguous references will raise
+        # AnalysisException at runtime. Drop or alias right-side duplicates as needed.
+        on_expr = cond_result.pyspark_expr.strip()
+        is_simple_equi = (
+            on_expr.startswith('"') or on_expr.startswith('[')
+        )
+        if not is_simple_equi:
+            s.warn(
+                f"JOINER {node.instance_name}: complex join condition — if {left_df} and "
+                f"{right_df} share non-key column names, downstream references will be "
+                f"ambiguous. Drop or alias duplicates after the join."
+            )
+            s.emit(f"# If column name conflicts exist, resolve with:")
+            s.emit(f"# {out_df} = {out_df}.drop({right_df}['COLUMN_NAME'])  # repeat per conflict")
+
     # ------------------------------------------------------------------
     # Lookup
     # ------------------------------------------------------------------
@@ -595,7 +645,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -642,12 +692,18 @@ class GlueJobCodeBuilder:
         s.emit(f"    on={cond_result.pyspark_expr},")
         s.emit(f'    how="left",   # PC default: return null on no match')
         s.emit(f")")
-        if lkp_output_ports:
-            cols = " + ".join(
-                f'[F.col("{p.name}")]' for p in lkp_output_ports
-            )
-            s.emit(f"# Select original columns plus lookup outputs")
-            s.emit(f"# Adjust column list if there are naming conflicts")
+        # Always select to drop lookup table's non-output columns and avoid duplicates
+        lkp_col_exprs = (
+            [f'F.col("{p.name}")' for p in lkp_output_ports]
+            if lkp_output_ports else []
+        )
+        s.emit(f"# Keep input columns plus lookup output ports; drop all other lookup columns")
+        s.emit(f"{out_df} = {out_df}.select(")
+        s.emit(f"    [F.col(c) for c in {in_df}.columns]")
+        if lkp_col_exprs:
+            lkp_cols_str = ", ".join(lkp_col_exprs)
+            s.emit(f"    + [{lkp_cols_str}]")
+        s.emit(f")")
 
     # ------------------------------------------------------------------
     # Router
@@ -657,7 +713,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
 
         s.section(f"ROUTER: {node.instance_name}  ({len(t.router_groups)} groups)")
 
@@ -687,7 +743,22 @@ class GlueJobCodeBuilder:
 
             s.emit("")
 
-        # Primary output (first group) for downstream nodes
+        # Build group name → df var mapping for wiring
+        group_name_to_var = {
+            grp.name: f"{g.df_var(node.instance_name)}_{_safe_var(grp.name)}"
+            for grp in t.router_groups
+        }
+
+        # Wire each direct successor to the correct group DataFrame.
+        # PC Router connectors carry the group output port name as from_field,
+        # which matches the RouterGroupDef.name.
+        for edge in g.fields_flowing_out_of(node.instance_name):
+            matched_var = group_name_to_var.get(edge.from_field)
+            if matched_var and edge.to_node not in self._node_group_wiring:
+                self._node_group_wiring[edge.to_node] = matched_var
+
+        # Fallback: set base key to first group so any unmatched successor
+        # gets a usable (if possibly wrong) DataFrame rather than df_UNKNOWN.
         if t.router_groups:
             self._node_output[node.instance_name] = (
                 g.df_var(node.instance_name) + "_" + _safe_var(t.router_groups[0].name)
@@ -701,7 +772,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -762,7 +833,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -786,7 +857,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -818,7 +889,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
         out_df = g.df_var(node.instance_name)
         self._node_output[node.instance_name] = out_df
 
@@ -861,26 +932,21 @@ class GlueJobCodeBuilder:
 
         if len(groups) == 1:
             group_key, cols = next(iter(groups.items()))
-            struct_elements = ", ".join(
-                f'F.col("{c}").alias("{c}")' for c in cols
+            # One struct per occurrence column — each becomes its own row after explode.
+            # E.g. ITEM_1, ITEM_2, ITEM_3 → 3 rows, field named by group_key.
+            array_elements = ", ".join(
+                f'F.struct(F.col("{c}").alias("{group_key}"))' for c in cols
             )
-            array_entries = ", ".join(
-                f'F.struct({", ".join(f"F.col(\"{c}\")" for c in cols)})' for _ in [1]
-            )
-            # For true multi-row normalizer we need one struct per occurrence column
-            s.emit(f"# Combine occurrence columns into an array of structs, then explode")
-            all_cols = cols  # all occurrence columns
-            structs = f'F.struct({", ".join(f"F.col(\"{c}\")" for c in all_cols)})'
+            s.emit(f"# One struct per occurrence column so explode yields one row per occurrence")
             s.emit(f'{out_df} = {in_df}.select(')
             if passthrough_cols:
                 pt_cols = ", ".join(f'F.col("{c}")' for c in passthrough_cols)
                 s.emit(f'    {pt_cols},')
-            s.emit(f'    F.explode(F.array({structs})).alias("_norm"),')
+            s.emit(f'    F.explode(F.array({array_elements})).alias("_norm"),')
             s.emit(f').select(')
             if passthrough_cols:
                 s.emit(f'    {pt_cols},')
-            for c in all_cols:
-                s.emit(f'    F.col("_norm.{c}").alias("{c}"),')
+            s.emit(f'    F.col("_norm.{group_key}").alias("{group_key}"),')
             s.emit(f')')
         else:
             # Multiple groups — needs a cross-product explode; emit skeleton
@@ -900,7 +966,7 @@ class GlueJobCodeBuilder:
         g = self.graph
         s = self.script
         upstream = g.primary_upstream(node.instance_name)
-        in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+        in_df = self._resolve_in_df(node.instance_name, upstream)
 
         tgt_def = self.folder.targets.get(node.transformation_name)
         db_type = tgt_def.db_type if tgt_def else "Unknown"
@@ -921,10 +987,43 @@ class GlueJobCodeBuilder:
         else:
             write_df = in_df
 
-        if _is_lakehouse(db_type):
+        if db_type.upper() == "FLAT FILE":
+            self._build_flat_file_target(node, tgt_def, tgt_name, write_df)
+        elif _is_lakehouse(db_type):
             self._build_lakehouse_target(node, tgt_def, write_df, db_type)
         else:
             self._build_jdbc_target(node, tgt_def, tgt_name, owner, write_df, db_type)
+
+    def _build_flat_file_target(
+        self, node: PipelineNode, tgt_def: Optional[TargetDef],
+        tgt_name: str, write_df: str,
+    ) -> None:
+        s = self.script
+        delim = (tgt_def.delimiter if tgt_def and tgt_def.delimiter else ",")
+        path_arg = _arg_name(f"S3_OUTPUT_PATH_{_safe_var(tgt_name)}")
+        s.add_arg(path_arg)
+        s.emit(f"# Writing FLAT FILE target: {tgt_name}")
+        s.emit(f"({write_df}.write")
+        s.emit(f'    .format("csv")')
+        s.emit(f'    .option("header", "true")')
+        s.emit(f'    .option("sep", "{delim}")')
+        s.emit(f'    .mode("overwrite")')
+        s.emit(f'    .save(args["{path_arg}"]))')
+
+    def _has_upstream_update_strategy(self, node_name: str) -> bool:
+        """Return True if any node upstream of node_name is an Update Strategy transformation."""
+        visited: Set[str] = set()
+        queue = list(self.graph.all_upstream_names(node_name))
+        while queue:
+            n = queue.pop()
+            if n in visited:
+                continue
+            visited.add(n)
+            nd = self.graph.nodes.get(n)
+            if nd and nd.transformation_def and nd.transformation_def.type == TransformationType.UPDATE_STRATEGY:
+                return True
+            queue.extend(self.graph.all_upstream_names(n))
+        return False
 
     def _build_jdbc_target(
         self, node: PipelineNode, tgt_def: Optional[TargetDef],
@@ -936,6 +1035,17 @@ class GlueJobCodeBuilder:
         s.add_arg(conn_arg)
         table_ref = f"{owner}{tgt_name}"
 
+        has_us = self._has_upstream_update_strategy(node.instance_name)
+        if has_us:
+            s.warn(
+                f"Target '{tgt_name}' has an upstream Update Strategy — simple overwrite will "
+                "truncate the table. Use the _insert/_update/_delete DataFrames from the Update "
+                "Strategy section and implement a Delta merge or JDBC upsert instead."
+            )
+            write_mode = '"append"  # WARNING: upstream Update Strategy detected — see above'
+        else:
+            write_mode = '"overwrite"  # TODO: change to "append" as needed'
+
         conn_var = f"_conn_tgt_{_safe_var(conn_key)}"
         s.emit(f'{conn_var} = glueContext.extract_jdbc_conf(args["{conn_arg}"])')
         s.emit(f"({write_df}.write")
@@ -944,7 +1054,7 @@ class GlueJobCodeBuilder:
         s.emit(f'    .option("dbtable", "{table_ref}")')
         s.emit(f'    .option("user", {conn_var}["user"])')
         s.emit(f'    .option("password", {conn_var}["password"])')
-        s.emit(f'    .mode("overwrite")  # TODO: change to "append" as needed')
+        s.emit(f'    .mode({write_mode})')
         s.emit(f"    .save()")
         s.emit(f")")
 
@@ -996,7 +1106,7 @@ class GlueJobCodeBuilder:
         else:
             g = self.graph
             upstream = g.primary_upstream(node.instance_name)
-            in_df = self._node_output.get(upstream, "df_UNKNOWN") if upstream else "df_UNKNOWN"
+            in_df = self._resolve_in_df(node.instance_name, upstream)
             out_df = g.df_var(node.instance_name)
             self._node_output[node.instance_name] = out_df
             self.script.todo(
