@@ -1,0 +1,103 @@
+# =============================================================================
+# validation_rules.yaml — Sample validation config for SALES_MART migration
+# =============================================================================
+
+version: "1"
+
+connections:
+  source:
+    dsn: "mssql+pyodbc://etl_user:s3cr3t@sqlserver.corp.local:1433/SalesDB?driver=ODBC+Driver+17+for+SQL+Server"
+  target:
+    dsn: "databricks://token:dapi_secret@workspace.azuredatabricks.net/sales_mart"
+
+validations:
+
+  # ---------------------------------------------------------------------------
+  # ORDERS table
+  # ---------------------------------------------------------------------------
+  - source_table: "dbo.ORDERS"
+    target_table: "orders"
+
+    recon:
+      tolerance_pct: 1.0        # allow up to 1% row count difference
+
+    schema_diff:
+      enabled: true
+      ignore_columns:
+        - ETL_INSERT_DT          # added by Glue ETL, not in source
+        - ETL_UPDATE_DT
+      type_equivalences:
+        - [nvarchar, string]
+        - [datetime2, timestamp]
+        - [bit, boolean]
+
+    rules:
+      - name: "no null order IDs"
+        type: null_check
+        column: ORDER_ID
+        expect: not_null
+
+      - name: "order amount non-negative"
+        type: range_check
+        column: ORDER_AMT
+        min: 0
+        max: 10000000
+
+      - name: "unique order IDs"
+        type: unique_check
+        column: ORDER_ID
+
+      - name: "valid status values"
+        type: value_set
+        column: STATUS
+        allowed_values:
+          - PENDING
+          - APPROVED
+          - CANCELLED
+          - RETURNED
+
+      - name: "customer FK valid"
+        type: referential
+        column: CUSTOMER_ID
+        parent_table: customers
+        parent_column: CUSTOMER_ID
+
+      - name: "no future order dates"
+        type: custom_sql
+        sql: "SELECT COUNT(*) FROM {table} WHERE ORDER_DATE > CURRENT_DATE"
+        expect_count: 0
+
+  # ---------------------------------------------------------------------------
+  # PATIENT table (HIPAA-sensitive)
+  # ---------------------------------------------------------------------------
+  - source_table: "dbo.PATIENT"
+    target_table: "patient"
+
+    recon:
+      tolerance_pct: 0.0        # zero tolerance for patient record loss
+
+    schema_diff:
+      enabled: true
+      ignore_columns:
+        - ETL_INSERT_DT
+      type_equivalences:
+        - [nvarchar, string]
+        - [datetime2, timestamp]
+
+    rules:
+      - name: "no null patient IDs"
+        type: null_check
+        column: PATIENT_ID
+        expect: not_null
+
+      - name: "no null SSN"            # HIPAA — will be flagged
+        type: null_check
+        column: SSN
+        expect: not_null
+
+      - name: "active flag valid"
+        type: value_set
+        column: ACTIVE_FLAG
+        allowed_values:
+          - Y
+          - N
