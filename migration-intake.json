@@ -1,0 +1,66 @@
+{
+  "generated_at": "2026-03-23T19:07:46.842342",
+  "pc_version": "10.5",
+  "mapping_count": "500 \u2013 1000",
+  "workflow_count": "300 \u2013 750",
+  "complexity_mix": "Mix of simple and moderate (multi-source, union, router, normalizer)",
+  "advanced_features": [
+    "Parameter files / mapping variables",
+    "Stored procedure calls"
+  ],
+  "metadata_access": [
+    "XML exports from Designer / Repository Manager",
+    "Direct access to repository database (Oracle/SQL Server)",
+    "pmrep command-line tool available"
+  ],
+  "source_databases": [
+    "SQL Server"
+  ],
+  "source_files": [
+    "Fixed-width flat files",
+    "Excel",
+    "S3 flat files (CSV / delimited)"
+  ],
+  "source_other": [
+    "None"
+  ],
+  "target_databases": [
+    "On-prem Oracle / SQL Server (staying)"
+  ],
+  "target_lakehouse": [
+    "S3 (raw / landing zone)",
+    "S3 + Glue Catalog (Parquet / ORC)",
+    "Delta Lake on S3 (Databricks)"
+  ],
+  "databricks_use_case": "Mix of the above",
+  "aws_account_structure": "Separate accounts per environment (dev / stage / prod)",
+  "aws_region": "us-east-1",
+  "databricks_cloud": "AWS",
+  "current_scheduler": "Other",
+  "target_orchestrator": "Not decided yet",
+  "iac_tool": "Terraform",
+  "team_size": "3 \u2013 5",
+  "team_skills": [
+    "Python (general)",
+    "PySpark",
+    "SQL (strong)"
+  ],
+  "cicd_platform": "Azure DevOps",
+  "git_platform": "1,5",
+  "migration_approach": "Hybrid \u2014 lift-and-shift first, optimize later",
+  "timeline_pressure": "Hard deadline (license expiry / platform decommission)",
+  "hard_deadline": "Q3 2027",
+  "parallel_run_tolerance": "2 \u2013 3 months",
+  "validation_bar": [
+    "Row counts match source vs target",
+    "Schema / column definitions match",
+    "Null rate and value distribution checks",
+    "Business rule assertions (custom SQL checks)",
+    "Sign-off from data owner"
+  ],
+  "pii_sensitivity": "1,2,3,4",
+  "compliance_requirements": [
+    "HIPAA"
+  ],
+  "additional_notes": ""
+}

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(sed -n '68,215p' C:/tmp/convert/tools/glue_gen/cli.py)",
+      "Bash(sed -n '63,170p' C:/tmp/convert/tools/databricks_gen/cli.py)",
+      "Bash(sed -n '59,280p' C:/tmp/convert/tools/param_translator/cli.py)",
+      "Bash(sed -n '50,200p' C:/tmp/convert/tools/validation_harness/cli.py)"
+    ]
+  }
+}

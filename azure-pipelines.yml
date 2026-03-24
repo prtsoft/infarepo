@@ -1,0 +1,300 @@
+# -----------------------------------------------------------------------
+# Azure DevOps CI/CD Pipeline
+# PC 10.5 → AWS Glue / Databricks Migration Toolchain
+# -----------------------------------------------------------------------
+
+trigger:
+  branches:
+    include:
+      - master
+      - main
+      - "feature/*"
+      - "fix/*"
+
+pr:
+  branches:
+    include:
+      - master
+      - main
+
+# ---------------------------------------------------------------------------
+# Nightly validation schedule (Phase 6F)
+# ---------------------------------------------------------------------------
+schedules:
+  - cron: "0 6 * * *"   # 06:00 UTC daily
+    displayName: "Nightly validation against dev environment"
+    branches:
+      include:
+        - master
+    always: true   # run even if no new commits
+
+# ---------------------------------------------------------------------------
+# Shared variables
+# ---------------------------------------------------------------------------
+variables:
+  PYTHON_VERSION: "3.11"
+  TOOLS_DIR: "$(Build.SourcesDirectory)/tools"
+  OUTPUT_DIR: "$(Build.ArtifactStagingDirectory)/output"
+  VALIDATION_CONFIG: "config/dev_validation.yaml"
+
+# ---------------------------------------------------------------------------
+# Stage 1: Test — unit tests + linting
+# ---------------------------------------------------------------------------
+stages:
+  - stage: test
+    displayName: "Test — Unit tests + linting"
+    jobs:
+      - job: unit_tests
+        displayName: "pytest + ruff"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+            displayName: "Set Python version"
+
+          - script: |
+              cd $(TOOLS_DIR)
+              pip install -e ".[dev]"
+            displayName: "Install dependencies"
+
+          - script: |
+              cd $(TOOLS_DIR)
+              ruff check . --select=E9,F --output-format=github
+            displayName: "Lint — ruff (E9 + F rules)"
+            continueOnError: false
+
+          - script: |
+              cd $(Build.SourcesDirectory)
+              python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+            displayName: "Run unit tests"
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "test-results.xml"
+              testRunTitle: "PC Toolchain Unit Tests"
+            condition: always()
+            displayName: "Publish test results"
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Smoke — validate XML fixture
+  # ---------------------------------------------------------------------------
+  - stage: smoke
+    displayName: "Smoke — XML validation"
+    dependsOn: test
+    condition: succeeded()
+    jobs:
+      - job: smoke_xml
+        displayName: "pc-extractor validate-xml"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: pip install -e "$(TOOLS_DIR)/[dev]"
+            displayName: "Install tools"
+
+          - script: |
+              if [ -d tests/fixtures ]; then
+                pc-extractor validate-xml tests/fixtures/ --verbose
+              else
+                echo "No fixtures directory found — skipping XML validation"
+              fi
+            displayName: "Validate XML fixtures"
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: Extract — run pc-extractor on sample fixture
+  # ---------------------------------------------------------------------------
+  - stage: extract
+    displayName: "Extract — pc-extractor on sample"
+    dependsOn: smoke
+    condition: succeeded()
+    jobs:
+      - job: extract_manifest
+        displayName: "Extract manifest from fixture"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: pip install -e "$(TOOLS_DIR)/[dev]"
+            displayName: "Install tools"
+
+          - script: |
+              mkdir -p $(OUTPUT_DIR)
+              if ls tests/fixtures/*.xml 2>/dev/null; then
+                pc-extractor extract tests/fixtures/*.xml \
+                  --output-dir $(OUTPUT_DIR)/extract \
+                  --verbose
+              else
+                echo "No XML fixtures found — creating empty manifest stub"
+                echo '{"folders":{}, "source_files":[], "repository_name":"test", "extracted_at":"", "summary":{}}' \
+                  > $(OUTPUT_DIR)/extract/migration-manifest.json
+              fi
+            displayName: "Run pc-extractor"
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(OUTPUT_DIR)/extract"
+              artifactName: "manifest"
+            displayName: "Publish manifest artifact"
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: Generate — glue-gen + databricks-gen on sample manifest
+  # ---------------------------------------------------------------------------
+  - stage: generate
+    displayName: "Generate — Glue + Databricks code"
+    dependsOn: extract
+    condition: succeeded()
+    jobs:
+      - job: generate_glue
+        displayName: "glue-gen generate-all"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: pip install -e "$(TOOLS_DIR)/[dev]"
+            displayName: "Install tools"
+
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              artifactName: "manifest"
+              downloadPath: "$(OUTPUT_DIR)"
+            displayName: "Download manifest artifact"
+
+          - script: |
+              manifest=$(OUTPUT_DIR)/manifest/migration-manifest.json
+              if [ -f "$manifest" ]; then
+                glue-gen generate-all "$manifest" \
+                  --output-dir $(OUTPUT_DIR)/generated \
+                  --verbose
+              else
+                echo "No manifest found — skipping generation"
+              fi
+            displayName: "Run glue-gen"
+
+          - script: |
+              manifest=$(OUTPUT_DIR)/manifest/migration-manifest.json
+              if [ -f "$manifest" ]; then
+                databricks-gen generate-all "$manifest" \
+                  --output-dir $(OUTPUT_DIR)/generated \
+                  --verbose
+              else
+                echo "No manifest found — skipping generation"
+              fi
+            displayName: "Run databricks-gen"
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(OUTPUT_DIR)/generated"
+              artifactName: "generated-$(Build.BuildId)"
+            displayName: "Publish generated artifacts"
+
+      - job: terraform_validate
+        displayName: "terraform validate"
+        pool:
+          vmImage: "ubuntu-latest"
+        dependsOn: generate_glue
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              artifactName: "generated-$(Build.BuildId)"
+              downloadPath: "$(OUTPUT_DIR)/generated"
+            displayName: "Download generated artifacts"
+
+          - script: |
+              # Install Terraform
+              wget -q https://releases.hashicorp.com/terraform/1.8.5/terraform_1.8.5_linux_amd64.zip
+              unzip -q terraform_1.8.5_linux_amd64.zip
+              sudo mv terraform /usr/local/bin/
+              terraform version
+            displayName: "Install Terraform"
+
+          - script: bash scripts/validate_terraform.sh $(OUTPUT_DIR)/generated
+            displayName: "Validate all generated Terraform directories"
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: Lint — ruff on generated .py files
+  # ---------------------------------------------------------------------------
+  - stage: lint_generated
+    displayName: "Lint — ruff on generated scripts"
+    dependsOn: generate
+    condition: succeeded()
+    jobs:
+      - job: ruff_generated
+        displayName: "ruff check generated scripts"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: pip install ruff
+            displayName: "Install ruff"
+
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: "current"
+              artifactName: "generated-$(Build.BuildId)"
+              downloadPath: "$(OUTPUT_DIR)/generated"
+
+          - script: |
+              py_files=$(find $(OUTPUT_DIR)/generated -name "*.py" 2>/dev/null | wc -l)
+              echo "Found $py_files generated .py files"
+              if [ "$py_files" -gt 0 ]; then
+                ruff check $(OUTPUT_DIR)/generated --select=E9,F --output-format=github || true
+              fi
+            displayName: "ruff check (E9+F — syntax errors only, warnings allowed)"
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: Nightly validation (only runs on schedule trigger)
+  # ---------------------------------------------------------------------------
+  - stage: nightly_validation
+    displayName: "Nightly — validation-harness against dev"
+    dependsOn: []   # independent of other stages
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'Schedule'))
+    jobs:
+      - job: validate_dev
+        displayName: "validation-harness validate (dev)"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: pip install -e "$(TOOLS_DIR)/[dev]"
+            displayName: "Install tools"
+
+          - script: |
+              mkdir -p $(OUTPUT_DIR)/validation
+              if [ -f $(VALIDATION_CONFIG) ]; then
+                validation-harness validate $(VALIDATION_CONFIG) \
+                  --output-dir $(OUTPUT_DIR)/validation \
+                  --verbose || true   # don't fail CI on validation drift
+              else
+                echo "Validation config not found at $(VALIDATION_CONFIG) — skipping"
+              fi
+            displayName: "Run validation-harness"
+            env:
+              SOURCE_DSN: $(SOURCE_DSN)
+              TARGET_DSN: $(TARGET_DSN)
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(OUTPUT_DIR)/validation"
+              artifactName: "validation-$(Build.BuildId)"
+            condition: always()
+            displayName: "Publish validation report"

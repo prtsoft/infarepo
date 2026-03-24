@@ -1,0 +1,76 @@
+# =============================================================================
+# SALES_MART.prm — PowerCenter parameter file
+# Environment: DEV
+# Last modified: 2024-01-15
+# =============================================================================
+
+# Global parameters — inherited by all workflows/sessions in this file
+[Global]
+$$ENV=DEV
+$$BATCH_ENABLED=Y
+$$MAX_ERRORS=100
+$$EMPTY_PARAM=
+$$LEGACY_FLAG=0
+
+# -----------------------------------------------------------------------------
+# Daily sales load workflow
+# -----------------------------------------------------------------------------
+[SALES_MART.WF_SALES_MART_DAILY]
+$$START_DATE=01/01/2024
+$$END_DATE=12/31/2024
+$$RUN_DATE=2024-03-23
+$$ORACLE_RUN_DATE=23-MAR-2024
+$$COMPACT_DATE=20240323
+$$DATE_MASK=MM/DD/YYYY
+$$DATETIME_MASK=MM/DD/YYYY HH24:MI:SS
+$$ORACLE_MASK=DD-MON-YYYY HH24:MI:SS
+$$LOG_DIR=$PMRootDir/logs
+$$SOURCE_DIR=/data/inbound/sales/
+
+# Session-level overrides for the main load session
+[SALES_MART.WF_SALES_MART_DAILY:s_M_LOAD_FACT_ORDERS]
+$$START_DATE=01/15/2024
+$$FILTER_CONDITION=STATUS != 'CANCELLED' AND REGION IN ('NORTH','SOUTH','EAST')
+$$LOOKUP_SQL=SELECT CUSTOMER_ID, CUST_NAME, REGION FROM dbo.DIM_CUSTOMER WHERE ACTIVE_FLAG = 1
+$$OVERRIDE_SQL=SELECT o.ORDER_ID, o.CUSTOMER_ID, o.ORDER_AMT, od.PROD_CODE FROM dbo.ORDERS o INNER JOIN dbo.ORDER_DETAIL od ON o.ORDER_ID = od.ORDER_ID WHERE o.ORDER_DATE >= DATEADD(day, -30, GETDATE()) AND o.STATUS NOT IN ('CANCELLED', 'RETURNED')
+$$LOAD_MODE=FULL
+$$DECIMAL_THRESHOLD=0.005
+$$INT_BATCH_SIZE=5000
+
+# Multi-line SQL value (backslash continuation)
+[SALES_MART.WF_SALES_MART_DAILY:s_M_ENRICH_ORDERS]
+$$ENRICH_SQL=SELECT p.PROD_CODE, p.PROD_DESC, p.UNIT_PRICE \
+  FROM dbo.PRODUCTS p \
+  INNER JOIN dbo.PRODUCT_CATEGORY pc ON p.CAT_ID = pc.CAT_ID \
+  WHERE p.ACTIVE = 'Y'
+$$PRICE_THRESHOLD=99.99
+$$REGION_LIST=NORTH,SOUTH,EAST,WEST
+
+# Multi-line SQL (bare continuation — no backslash)
+[SALES_MART.WF_SALES_MART_DAILY:s_M_PROC_ORDERS_SP]
+$$SP_FILTER=SELECT ORDER_ID, CUSTOMER_ID FROM dbo.ORDERS
+WHERE STATUS = 'APPROVED'
+AND ORDER_DATE BETWEEN '2024-01-01' AND '2024-12-31'
+$$SP_OUTPUT_PATH=$PMTargetFileDir/output/orders/
+$$NUMERIC_SCALE=2
+
+# -----------------------------------------------------------------------------
+# Nightly patient extract workflow
+# -----------------------------------------------------------------------------
+[PATIENT_EXTRACT.WF_PATIENT_EXTRACT_NIGHTLY]
+$$EXTRACT_DATE=2024-03-23
+$$EXTRACT_DT_MASK=YYYY-MM-DD
+$$EXTRACT_DATETIME_MASK=YYYY-MM-DD HH24:MI:SS
+$$PHI_MASKING=Y ; HIPAA — always mask PII fields
+$$PATIENT_FILTER=ACTIVE_FLAG = 1 AND DISCHARGE_DATE IS NULL
+$$OUTPUT_PATH=s3://analytics-lake/patient/extract/
+$$PARTITION_COL=EXTRACT_DATE
+$$COMPACT_TS=20240323143000
+
+# ISO-style datetime
+[PATIENT_EXTRACT.WF_PATIENT_EXTRACT_NIGHTLY:s_M_EXTRACT_PATIENT_DELTA]
+$$RUN_TIMESTAMP=2024-03-23T14:30:00
+$$DELTA_PATH=s3://analytics-lake/patient/delta/
+$$LOAD_TYPE=INCREMENTAL
+$$LOOKBACK_DAYS=7
+$$CACHE_DIR=$PMCacheDir/patient/
