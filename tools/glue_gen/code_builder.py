@@ -699,16 +699,51 @@ class GlueJobCodeBuilder:
         strategy_expr = t.attributes.get("Update Strategy Expression", "DD_INSERT")
         s.section(f"UPDATE STRATEGY: {node.instance_name}")
         s.emit(f"# PC Update Strategy Expression: {strategy_expr}")
-        s.todo(
-            f"Update Strategy '{strategy_expr}' — implement as Delta MERGE or "
-            "target JDBC upsert. Example below uses a 'flag' column approach."
-        )
-        s.emit(f"# Common strategy values: DD_INSERT=0, DD_UPDATE=1, DD_DELETE=2, DD_REJECT=3")
-        s.emit(f"# Add a column to flag the operation, then handle in the target write")
-        s.emit(f"{out_df} = {in_df}.withColumn(")
-        s.emit(f'    "_update_flag",')
-        s.emit(f"    F.lit(0)  # TODO: translate strategy expression: {strategy_expr}")
-        s.emit(f")")
+        s.emit(f"# DD_INSERT=0, DD_UPDATE=1, DD_DELETE=2, DD_REJECT=3")
+
+        # Detect which operations are present in the strategy expression
+        expr_upper = strategy_expr.upper()
+        has_insert  = "DD_INSERT"  in expr_upper
+        has_update  = "DD_UPDATE"  in expr_upper
+        has_delete  = "DD_DELETE"  in expr_upper
+        has_reject  = "DD_REJECT"  in expr_upper
+        has_iif     = "IIF("       in expr_upper or "IF(" in expr_upper
+
+        if not any([has_insert, has_update, has_delete, has_reject, has_iif]):
+            # Simple constant-only expression (e.g. just "DD_INSERT")
+            flag_val = "0"
+            if "DD_UPDATE" in expr_upper:
+                flag_val = "1"
+            elif "DD_DELETE" in expr_upper:
+                flag_val = "2"
+            elif "DD_REJECT" in expr_upper:
+                flag_val = "3"
+            s.emit(f"{out_df} = {in_df}.withColumn('_update_flag', F.lit({flag_val}))")
+        else:
+            # Translate the PC IIF/DECODE expression to a PySpark CASE WHEN
+            from .expr_translator import translate
+            result = translate(strategy_expr)
+            if result.confidence.value == "LOW":
+                s.warn(
+                    f"Low-confidence translation of Update Strategy expression: {strategy_expr!r}"
+                )
+                s.emit(f"# PC expression: {strategy_expr}")
+                s.emit(f"# Translated: {result.pyspark_expr}")
+            s.emit(f"# Add _update_flag column: 0=INSERT, 1=UPDATE, 2=DELETE, 3=REJECT")
+            s.emit(f"{out_df} = {in_df}.withColumn('_update_flag', {result.pyspark_expr})")
+
+        # Split into per-operation DataFrames for target write
+        s.emit(f"")
+        s.emit(f"# Split by operation type")
+        s.emit(f"df_{_safe_var(node.instance_name)}_insert = {out_df}.filter(F.col('_update_flag') == 0)")
+        s.emit(f"df_{_safe_var(node.instance_name)}_update = {out_df}.filter(F.col('_update_flag') == 1)")
+        s.emit(f"df_{_safe_var(node.instance_name)}_delete = {out_df}.filter(F.col('_update_flag') == 2)")
+        s.emit(f"df_{_safe_var(node.instance_name)}_reject = {out_df}.filter(F.col('_update_flag') == 3)")
+        s.emit(f"# Use df_*_insert/.._update/.._delete/.._reject in the target write")
+        s.emit(f"# INSERT: df.write.mode('append') or Delta merge whenNotMatchedInsertAll()")
+        s.emit(f"# UPDATE: DeltaTable.merge().whenMatchedUpdateAll()")
+        s.emit(f"# DELETE: DeltaTable.delete(condition)")
+        s.emit(f"# REJECT: df.write to reject/error path")
 
     # ------------------------------------------------------------------
     # Sequence Generator
@@ -779,17 +814,74 @@ class GlueJobCodeBuilder:
         self._node_output[node.instance_name] = out_df
 
         s.section(f"NORMALIZER: {node.instance_name}")
-        s.todo(
-            f"NORMALIZER requires manual translation. "
-            "Use F.explode() for array columns or F.stack() for pivoted columns. "
-            "Review the source column structure before implementing."
+
+        # Group OUTPUT ports by their REF_SOURCE_FIELD attribute.
+        # Each group represents one "occurrence" column (e.g. item_1, item_2, item_3).
+        # Pass-through (non-repeated) ports have an empty REF_SOURCE_FIELD.
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        passthrough_cols: list = []
+
+        for port in t.ports:
+            if "OUTPUT" not in port.port_type.upper():
+                continue
+            if port.ref_source_field:
+                groups[port.ref_source_field].append(port.name)
+            else:
+                passthrough_cols.append(port.name)
+
+        if not groups:
+            # No REF_SOURCE_FIELD metadata — fall back to a generic stub
+            s.warn(
+                f"NORMALIZER {node.instance_name}: no REF_SOURCE_FIELD metadata found. "
+                "Inspect source column structure and implement manually."
+            )
+            s.emit(f"# Use F.explode(F.array(...)) for repeated column groups")
+            s.emit(f"{out_df} = {in_df}  # TODO: implement NORMALIZER logic")
+            return
+
+        # Emit F.array([F.struct(...)]) + F.explode for each group
+        passthrough_str = (
+            "F.col(" + "), F.col(".join(f'"{c}"' for c in passthrough_cols) + ")"
+            if passthrough_cols else ""
         )
-        s.emit(f"# Example: if normalizing repeated column groups (COL_1, COL_2, COL_3):")
-        s.emit(f"# {out_df} = {in_df}.select(")
-        s.emit(f'#     F.col("key_column"),')
-        s.emit(f'#     F.explode(F.array(F.col("COL_1"), F.col("COL_2"), F.col("COL_3"))).alias("value")')
-        s.emit(f"# )")
-        s.emit(f"{out_df} = {in_df}  # TODO: implement NORMALIZER logic")
+
+        s.emit(f"# NORMALIZER: transpose repeated column groups into rows")
+        for group_key, cols in groups.items():
+            s.emit(f"# Group '{group_key}': columns {cols}")
+
+        if len(groups) == 1:
+            group_key, cols = next(iter(groups.items()))
+            struct_elements = ", ".join(
+                f'F.col("{c}").alias("{c}")' for c in cols
+            )
+            array_entries = ", ".join(
+                f'F.struct({", ".join(f"F.col(\"{c}\")" for c in cols)})' for _ in [1]
+            )
+            # For true multi-row normalizer we need one struct per occurrence column
+            s.emit(f"# Combine occurrence columns into an array of structs, then explode")
+            all_cols = cols  # all occurrence columns
+            structs = f'F.struct({", ".join(f"F.col(\"{c}\")" for c in all_cols)})'
+            s.emit(f'{out_df} = {in_df}.select(')
+            if passthrough_cols:
+                pt_cols = ", ".join(f'F.col("{c}")' for c in passthrough_cols)
+                s.emit(f'    {pt_cols},')
+            s.emit(f'    F.explode(F.array({structs})).alias("_norm"),')
+            s.emit(f').select(')
+            if passthrough_cols:
+                s.emit(f'    {pt_cols},')
+            for c in all_cols:
+                s.emit(f'    F.col("_norm.{c}").alias("{c}"),')
+            s.emit(f')')
+        else:
+            # Multiple groups — needs a cross-product explode; emit skeleton
+            s.warn(
+                f"NORMALIZER {node.instance_name} has {len(groups)} groups — "
+                "multi-group normalization requires manual wiring."
+            )
+            for group_key, cols in groups.items():
+                s.emit(f'# Group {group_key!r}: {cols}')
+            s.emit(f'{out_df} = {in_df}  # TODO: implement multi-group NORMALIZER')
 
     # ------------------------------------------------------------------
     # Target

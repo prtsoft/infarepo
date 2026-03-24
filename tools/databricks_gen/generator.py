@@ -52,7 +52,61 @@ from pc_extractor.models import (
 )
 from .models import GenerationReport, NotebookGenerationResult
 from .notebook_builder import DatabricksNotebookBuilder, render_notebook
-from .tf_builder import build_terraform_job, build_terraform_variables
+from .tf_builder import (
+    build_terraform_job,
+    build_terraform_variables,
+    build_databricks_job_module,
+    build_databricks_environment_main,
+    build_databricks_environment_variables,
+    build_databricks_environment_tfvars,
+    build_databricks_backend_tf,
+)
+
+
+# ---------------------------------------------------------------------------
+# Session param loader (same strategy as glue_gen.generator)
+# ---------------------------------------------------------------------------
+
+def _load_session_params(params_dir: Path, folder_name: str, mapping_name: str) -> dict:
+    """Load param-translator output for a specific folder+mapping."""
+    if not params_dir:
+        return {}
+
+    glue_params_dir = Path(params_dir) / "glue-params" / folder_name
+    if not glue_params_dir.is_dir():
+        return {}
+
+    mapping_upper = mapping_name.upper()
+    for json_file in glue_params_dir.glob("*.json"):
+        stem_parts = json_file.stem.upper().split(".")
+        if len(stem_parts) >= 2 and stem_parts[-1] == mapping_upper:
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                return {k: v for k, v in data.items() if not k.startswith("_")}
+            except Exception:
+                pass
+
+    for json_file in glue_params_dir.glob("*.json"):
+        try:
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+            section = data.get("_metadata", {}).get("section", "")
+            task_part = section.split(":")[-1].upper() if ":" in section else ""
+            if task_part == mapping_upper:
+                return {k: v for k, v in data.items() if not k.startswith("_")}
+        except Exception:
+            pass
+
+    merged_dir = Path(params_dir) / "glue-params" / "_merged"
+    if merged_dir.is_dir():
+        merged_files = list(merged_dir.glob("*.json"))
+        if merged_files:
+            try:
+                data = json.loads(merged_files[0].read_text(encoding="utf-8"))
+                return {k: v for k, v in data.items() if not k.startswith("_")}
+            except Exception:
+                pass
+
+    return {}
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +118,10 @@ log = logging.getLogger(__name__)
 def _generate_mapping(
     mapping: MappingDef,
     output_dir: Path,
+    folder_sources: Optional[dict] = None,
+    folder_targets: Optional[dict] = None,
+    session_params: Optional[dict] = None,
+    sp_strategy: str = "databricks-call",
 ) -> NotebookGenerationResult:
     result = NotebookGenerationResult(
         mapping_name=mapping.name,
@@ -73,7 +131,13 @@ def _generate_mapping(
     # Build notebook
     try:
         builder = DatabricksNotebookBuilder()
-        notebook = builder.build(mapping)
+        notebook = builder.build(
+            mapping,
+            folder_sources=folder_sources,
+            folder_targets=folder_targets,
+            session_params=session_params,
+            sp_strategy=sp_strategy,
+        )
         result.warnings = list(notebook.warnings)
 
         nb_dir = output_dir / "notebooks" / mapping.folder
@@ -82,6 +146,21 @@ def _generate_mapping(
         nb_path.write_text(render_notebook(notebook), encoding="utf-8")
         result.notebook_path = str(nb_path)
         log.info("  [NB]  %-50s  warnings=%d", mapping.name, len(notebook.warnings))
+
+        # Inline ruff lint (syntax errors only — E9, F rules)
+        try:
+            import subprocess as _sp
+            ruff = _sp.run(
+                ["ruff", "check", "--select=E9,F", "--output-format=text", str(nb_path)],
+                capture_output=True, text=True,
+            )
+            if ruff.returncode != 0:
+                for line in ruff.stdout.splitlines():
+                    if line.strip():
+                        result.warnings.append(f"ruff: {line}")
+                        log.warning("  [RUFF] %s", line)
+        except FileNotFoundError:
+            pass  # ruff not installed — skip silently
     except Exception as exc:
         log.error("  [ERROR] %s / %s: %s", mapping.folder, mapping.name, exc)
         result.warnings.append(f"Notebook generation failed: {exc}")
@@ -119,10 +198,65 @@ def _generate_folder_variables(folder_name: str, output_dir: Path) -> None:
 # Public entry points
 # ---------------------------------------------------------------------------
 
+def _generate_db_env_split(
+    folder_name: str,
+    mapping_names: List[str],
+    output_dir: Path,
+    intake: Optional[dict] = None,
+) -> None:
+    """Write modules/ + environments/ layout for Databricks multi-env Terraform."""
+    intake = intake or {}
+    aws_accounts: dict = intake.get("aws_accounts", {})
+    aws_region: str = intake.get("aws_region", "us-east-1")
+    tf_state: dict = intake.get("terraform_state", {})
+    s3_bucket    = tf_state.get("s3_bucket", "")
+    dynamo_table = tf_state.get("dynamodb_table", "")
+    db_config: dict = intake.get("databricks", {})
+
+    mod_dir = output_dir / "terraform" / "modules" / "databricks_job"
+    mod_dir.mkdir(parents=True, exist_ok=True)
+    (mod_dir / "main.tf").write_text(build_databricks_job_module(), encoding="utf-8")
+
+    envs = list(aws_accounts.keys()) if aws_accounts else ["dev", "staging", "prod"]
+
+    for env in envs:
+        env_data = aws_accounts.get(env, {})
+        region      = env_data.get("region", aws_region)
+        account_id  = env_data.get("account_id", "")
+        db_env      = db_config.get(env, {})
+        workspace   = db_env.get("workspace_url", "")
+        cluster_id  = db_env.get("cluster_id", "")
+
+        env_dir = output_dir / "terraform" / "environments" / env
+        env_dir.mkdir(parents=True, exist_ok=True)
+
+        (env_dir / "main.tf").write_text(
+            build_databricks_environment_main(folder_name, mapping_names, env),
+            encoding="utf-8",
+        )
+        (env_dir / "variables.tf").write_text(
+            build_databricks_environment_variables(),
+            encoding="utf-8",
+        )
+        (env_dir / "terraform.tfvars").write_text(
+            build_databricks_environment_tfvars(env, workspace, cluster_id),
+            encoding="utf-8",
+        )
+        (env_dir / "backend.tf").write_text(
+            build_databricks_backend_tf(env, s3_bucket, dynamo_table, region, folder_name),
+            encoding="utf-8",
+        )
+    log.info("  [ENV-SPLIT] %s → %d environments", folder_name, len(envs))
+
+
 def generate_all(
     manifest: MigrationManifest,
     output_dir: Path,
     folder_filter: Optional[List[str]] = None,
+    params_dir: Optional[Path] = None,
+    env_split: bool = False,
+    intake: Optional[dict] = None,
+    sp_strategy: str = "databricks-call",
 ) -> GenerationReport:
     """
     Generate Databricks notebooks + Terraform for all DATABRICKS-routed mappings.
@@ -162,7 +296,14 @@ def generate_all(
                 report.results.append(result)
                 continue
 
-            result = _generate_mapping(mapping, output_dir)
+            sp = _load_session_params(params_dir, folder_name, mapping.name) if params_dir else {}
+            result = _generate_mapping(
+                mapping, output_dir,
+                folder_sources=folder.sources,
+                folder_targets=folder.targets,
+                session_params=sp,
+                sp_strategy=sp_strategy,
+            )
             folder_results.append(result)
             report.results.append(result)
             report.generated += 1
@@ -171,6 +312,9 @@ def generate_all(
         if folder_results:
             _generate_folder_variables(folder_name, output_dir)
             folders_with_results[folder_name] = folder_results
+            if env_split:
+                names = [r.mapping_name for r in folder_results if not r.skipped and r.notebook_path]
+                _generate_db_env_split(folder_name, names, output_dir, intake=intake)
 
     _write_report(report, output_dir)
     log.info(
@@ -185,6 +329,7 @@ def generate_single(
     folder_name: str,
     mapping_name: str,
     output_dir: Path,
+    params_dir: Optional[Path] = None,
 ) -> NotebookGenerationResult:
     """Generate a single mapping by folder and mapping name."""
     folder = manifest.folders.get(folder_name)
@@ -202,7 +347,13 @@ def generate_single(
             skip_reason=mapping.target_platform.value if mapping.target_platform else "UNKNOWN",
         )
 
-    return _generate_mapping(mapping, Path(output_dir))
+    sp = _load_session_params(params_dir, folder_name, mapping_name) if params_dir else {}
+    return _generate_mapping(
+        mapping, Path(output_dir),
+        folder_sources=folder.sources,
+        folder_targets=folder.targets,
+        session_params=sp,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -63,8 +63,24 @@ def cli():
     "--include-review", is_flag=True, default=False,
     help="Also generate stub scripts for REVIEW-routed mappings.",
 )
+@click.option(
+    "--params-dir", "params_dir", default=None,
+    type=click.Path(path_type=Path),
+    help="Directory containing param-translator output (glue-params/ sub-dir). "
+         "When set, actual param values are injected into Terraform default_arguments.",
+)
+@click.option(
+    "--env-split", "env_split", is_flag=True, default=False,
+    help="Generate multi-environment Terraform (modules/ + environments/dev,staging,prod). "
+         "Reads aws_accounts from --intake file when provided.",
+)
+@click.option(
+    "--intake", "intake_file", default=None,
+    type=click.Path(path_type=Path),
+    help="Path to migration-intake.json for environment-specific values.",
+)
 @click.option("--verbose", "-v", is_flag=True, default=False)
-def generate_all_cmd(manifest_file, output_dir, folder_filter, include_review, verbose):
+def generate_all_cmd(manifest_file, output_dir, folder_filter, include_review, params_dir, env_split, intake_file, verbose):
     """
     Generate Glue PySpark scripts and Terraform for all GLUE-routed mappings.
 
@@ -95,11 +111,21 @@ def generate_all_cmd(manifest_file, output_dir, folder_filter, include_review, v
     click.echo(f"  Generating into: {output_dir}")
     click.echo()
 
+    intake: Optional[dict] = None
+    if intake_file:
+        import json as _ijson
+        with open(intake_file, encoding="utf-8") as fh:
+            intake = _ijson.load(fh)
+        click.echo(f"  Intake: {intake_file}")
+
     report = generate_all(
         manifest,
         output_dir=output_dir,
         folder_filter=list(folder_filter) if folder_filter else None,
         include_review=include_review,
+        params_dir=params_dir,
+        env_split=env_split,
+        intake=intake,
     )
 
     _print_report(report)
@@ -120,8 +146,13 @@ def generate_all_cmd(manifest_file, output_dir, folder_filter, include_review, v
     "--output-dir", "-o", default="output",
     type=click.Path(path_type=Path), show_default=True,
 )
+@click.option(
+    "--params-dir", "params_dir", default=None,
+    type=click.Path(path_type=Path),
+    help="Directory containing param-translator output.",
+)
 @click.option("--verbose", "-v", is_flag=True, default=False)
-def generate_cmd(manifest_file, folder_name, mapping_name, output_dir, verbose):
+def generate_cmd(manifest_file, folder_name, mapping_name, output_dir, params_dir, verbose):
     """
     Generate a single mapping by folder and mapping name.
 
@@ -136,7 +167,7 @@ def generate_cmd(manifest_file, folder_name, mapping_name, output_dir, verbose):
         data = _json.load(fh)
     manifest = _load_manifest(data)
 
-    result = generate_single(manifest, folder_name, mapping_name, output_dir)
+    result = generate_single(manifest, folder_name, mapping_name, output_dir, params_dir=params_dir)
 
     if result.status == "SUCCESS":
         click.echo(f"  [OK]  {result.glue_script_path}")

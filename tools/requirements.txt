@@ -1,6 +1,35 @@
+# Core (all environments)
 click>=8.1
 lxml>=4.9
-dataclasses-json>=0.6
-pandas>=2.0
 rich>=13.0
+pyyaml>=6.0
+
+# Testing
 pytest>=7.4
+pytest-cov>=4.0
+ruff>=0.4
+
+# ── Database drivers ──────────────────────────────────────────────────────────
+# SQL Server (source systems): install ODBC Driver 17 or 18 for SQL Server first
+pyodbc>=4.0
+
+# Databricks SQL (target): validation-harness Databricks connections
+databricks-sql-connector>=3.0
+
+# ── Spark / Delta (code generation validation, local testing) ─────────────────
+# Not installed on Glue clusters or Databricks — provided by the runtime there
+# Uncomment for local PySpark testing:
+# pyspark>=3.3
+# delta-spark>=2.3
+
+# ── AWS ──────────────────────────────────────────────────────────────────────
+# Required for param-translator export-ssm and S3 path resolution
+boto3>=1.26
+
+# ── Excel ────────────────────────────────────────────────────────────────────
+# Required for S2T Excel export (write_s2t_excel) and EXCEL source reads
+openpyxl>=3.1
+
+# ── HTML reports ─────────────────────────────────────────────────────────────
+# Required for validation-harness sign-off HTML report
+jinja2>=3.1

@@ -202,7 +202,11 @@ def _parse_transformation(elem) -> TransformationDef:
 # Mapping parser
 # ---------------------------------------------------------------------------
 
-def _parse_mapping(elem, folder_name: str) -> MappingDef:
+def _parse_mapping(
+    elem,
+    folder_name: str,
+    reusable_transformations: Optional[Dict[str, TransformationDef]] = None,
+) -> MappingDef:
     m = MappingDef(
         name=_attr(elem, "NAME"),
         folder=folder_name,
@@ -210,25 +214,74 @@ def _parse_mapping(elem, folder_name: str) -> MappingDef:
         is_valid=_attr(elem, "ISVALID", "YES").upper() == "YES",
     )
 
-    # --- Transformations ---
+    # --- Transformations (inline, non-reusable) ---
+    inline_names: set = set()
     for te in elem.findall("TRANSFORMATION"):
-        m.transformations.append(_parse_transformation(te))
+        trf = _parse_transformation(te)
+        m.transformations.append(trf)
+        inline_names.add(trf.name)
 
     # --- Instances (maps instance name → transformation name+type) ---
     for ie in elem.findall("INSTANCE"):
         inst_type = _attr(ie, "TYPE")  # SOURCE, TARGET, TRANSFORMATION
+        is_reusable = _bool_attr(ie, "REUSABLE")
+        inst_name = _attr(ie, "NAME")
+        trf_name = _attr(ie, "TRANSFORMATION")
+
         m.instances.append(InstanceDef(
-            name=_attr(ie, "NAME"),
-            transformation_name=_attr(ie, "TRANSFORMATION"),
+            name=inst_name,
+            transformation_name=trf_name,
             transformation_type=_attr(ie, "TRANSFORMATIONTYPE") or inst_type,
-            reusable=_bool_attr(ie, "REUSABLE"),
+            reusable=is_reusable,
         ))
+
+        # If instance references a reusable transformation that is not inline,
+        # inject a copy of the reusable definition under the instance name so
+        # that lineage traversal and code generators can look it up by instance
+        # name rather than by transformation name.
+        if is_reusable and trf_name and trf_name not in inline_names:
+            reusable_map = reusable_transformations or {}
+            resolved = reusable_map.get(trf_name)
+            if resolved is not None and inst_name not in inline_names:
+                # Make a shallow copy so per-instance mutations don't affect the
+                # shared definition; set name to the instance name for lookups.
+                import copy as _copy
+                inst_trf = _copy.copy(resolved)
+                inst_trf = TransformationDef(
+                    name=inst_name,
+                    type=resolved.type,
+                    reusable=True,
+                    description=resolved.description,
+                    ports=list(resolved.ports),
+                    attributes=dict(resolved.attributes),
+                    sql_query=resolved.sql_query,
+                    filter_condition=resolved.filter_condition,
+                    lookup_condition=resolved.lookup_condition,
+                    stored_proc_name=resolved.stored_proc_name,
+                    router_groups=list(resolved.router_groups),
+                    join_condition=resolved.join_condition,
+                    join_type=resolved.join_type,
+                    field_dependencies=dict(resolved.field_dependencies),
+                )
+                m.transformations.append(inst_trf)
+                inline_names.add(inst_name)
+                log.debug(
+                    "Resolved reusable transformation '%s' → instance '%s'",
+                    trf_name, inst_name,
+                )
+            elif resolved is None:
+                log.debug(
+                    "Reusable transformation '%s' referenced by instance '%s' "
+                    "not found in folder; lineage will be incomplete",
+                    trf_name, inst_name,
+                )
+
         if inst_type == "SOURCE":
-            src_name = _attr(ie, "TRANSFORMATION")
+            src_name = trf_name
             if src_name and src_name not in m.sources:
                 m.sources.append(src_name)
         elif inst_type == "TARGET":
-            tgt_name = _attr(ie, "TRANSFORMATION")
+            tgt_name = trf_name
             if tgt_name and tgt_name not in m.targets:
                 m.targets.append(tgt_name)
 
@@ -387,8 +440,18 @@ def _parse_folder(elem) -> FolderDef:
         tgt = _parse_target(te)
         folder.targets[tgt.name] = tgt
 
+    # Parse all transformations at folder level first; separate reusable ones
+    for te in elem.findall("TRANSFORMATION"):
+        trf = _parse_transformation(te)
+        if trf.reusable:
+            folder.reusable_transformations[trf.name] = trf
+
+    # Resolve SHORTCUT elements (aliases to objects in other folders or the
+    # shared library) before parsing mappings so that instance lookups work.
+    _resolve_shortcuts(elem, folder)
+
     for me in elem.findall("MAPPING"):
-        m = _parse_mapping(me, folder.name)
+        m = _parse_mapping(me, folder.name, folder.reusable_transformations)
         folder.mappings[m.name] = m
 
     for we in elem.findall("WORKFLOW"):
@@ -396,6 +459,57 @@ def _parse_folder(elem) -> FolderDef:
         folder.workflows[wf.name] = wf
 
     return folder
+
+
+def _resolve_shortcuts(folder_elem, folder: FolderDef) -> None:
+    """
+    Resolve SHORTCUT elements into source/target/reusable aliases.
+
+    PC exports can contain SHORTCUT elements when a mapping references objects
+    that are defined in another folder or the shared library.  The Java
+    reference implementation resolves these via:
+        //SHORTCUT[@OBJECTSUBTYPE='Target Definition']/@REFOBJECTNAME
+
+    We store them as additional entries in the folder's dicts under the
+    shortcut NAME so that mapping instance lookups (which use the local NAME)
+    find them transparently.
+    """
+    for sc in folder_elem.findall("SHORTCUT"):
+        name = _attr(sc, "NAME")
+        ref_name = _attr(sc, "REFOBJECTNAME") or name
+        subtype = _attr(sc, "OBJECTSUBTYPE")
+        obj_type = _attr(sc, "OBJECTTYPE")
+
+        if not name:
+            continue
+
+        # Determine category from OBJECTSUBTYPE or OBJECTTYPE
+        subtype_upper = subtype.upper()
+        type_upper = obj_type.upper()
+
+        if "TARGET" in subtype_upper or "TARGET" in type_upper:
+            # Alias target definition
+            if ref_name in folder.targets and name not in folder.targets:
+                folder.targets[name] = folder.targets[ref_name]
+            elif name not in folder.targets:
+                log.debug("SHORTCUT '%s' → target '%s' not found in folder", name, ref_name)
+
+        elif "SOURCE" in subtype_upper or "SOURCE" in type_upper:
+            # Alias source definition
+            if ref_name in folder.sources and name not in folder.sources:
+                folder.sources[name] = folder.sources[ref_name]
+            elif name not in folder.sources:
+                log.debug("SHORTCUT '%s' → source '%s' not found in folder", name, ref_name)
+
+        else:
+            # Transformation shortcut — alias in reusable_transformations
+            if ref_name in folder.reusable_transformations and name not in folder.reusable_transformations:
+                folder.reusable_transformations[name] = folder.reusable_transformations[ref_name]
+            else:
+                log.debug(
+                    "SHORTCUT '%s' → reusable transformation '%s' not found in folder",
+                    name, ref_name,
+                )
 
 
 # ---------------------------------------------------------------------------

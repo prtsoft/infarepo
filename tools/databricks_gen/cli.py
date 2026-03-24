@@ -58,8 +58,29 @@ def cli():
     "--folder", "-f", "folder_filter", multiple=True,
     help="Only generate for these folder names (can be specified multiple times).",
 )
+@click.option(
+    "--params-dir", "params_dir", default=None,
+    type=click.Path(path_type=Path),
+    help="Directory containing param-translator output (glue-params/ sub-dir). "
+         "When set, actual param values are injected into notebook widget defaults.",
+)
+@click.option(
+    "--env-split", "env_split", is_flag=True, default=False,
+    help="Generate multi-environment Terraform (modules/ + environments/dev,staging,prod).",
+)
+@click.option(
+    "--intake", "intake_file", default=None,
+    type=click.Path(path_type=Path),
+    help="Path to migration-intake.json for environment-specific values.",
+)
+@click.option(
+    "--sp-strategy", "sp_strategy",
+    type=click.Choice(["databricks-call", "pyspark-udf", "jdbc-passthrough"]),
+    default="databricks-call", show_default=True,
+    help="How to generate code for STORED_PROCEDURE transformations.",
+)
 @click.option("--verbose", "-v", is_flag=True, default=False)
-def generate_all_cmd(manifest_json, output_dir, folder_filter, verbose):
+def generate_all_cmd(manifest_json, output_dir, folder_filter, params_dir, env_split, intake_file, sp_strategy, verbose):
     """
     Generate Databricks notebooks and Terraform for all DATABRICKS-routed mappings.
 
@@ -87,10 +108,20 @@ def generate_all_cmd(manifest_json, output_dir, folder_filter, verbose):
     click.echo(f"  Generating into: {output_dir}")
     click.echo()
 
+    intake = None
+    if intake_file:
+        with open(intake_file, encoding="utf-8") as fh:
+            intake = json.load(fh)
+        click.echo(f"  Intake: {intake_file}")
+
     report = generate_all(
         manifest,
         output_dir=output_dir,
         folder_filter=list(folder_filter) if folder_filter else None,
+        params_dir=params_dir,
+        env_split=env_split,
+        intake=intake,
+        sp_strategy=sp_strategy,
     )
 
     _print_report(report)

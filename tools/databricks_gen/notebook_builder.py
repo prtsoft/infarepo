@@ -96,8 +96,17 @@ def _translate_filter_expr(expr: str) -> Tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 def _source_read_code(src_name: str, db_type: str, table_name: str,
-                      sql_override: Optional[str]) -> List[str]:
-    """Generate PySpark code lines to read a source DataFrame."""
+                      sql_override: Optional[str],
+                      source_fields: Optional[list] = None) -> List[str]:
+    """
+    Generate PySpark code lines to read a source DataFrame.
+
+    Parameters
+    ----------
+    source_fields:
+        Optional list of FieldDef objects from the folder's SourceDef.  Used
+        to generate accurate F.substring() column extraction for FIXED_WIDTH sources.
+    """
     db_upper = db_type.upper() if db_type else ""
     lines: List[str] = []
     var = _safe_var(src_name)
@@ -165,14 +174,39 @@ def _source_read_code(src_name: str, db_type: str, table_name: str,
         s3_path_param = f"s3_input_path_{var}"
         lines += [
             f"# Source: {src_name} ({db_type}) — Fixed-Width file",
-            f'# TODO: define field positions for fixed-width parsing',
             f'{s3_path_param} = params.get("s3_input_path", "s3://BUCKET/PATH/")  # TODO: set correct S3 path',
-            f'df_{var} = (',
+            f'df_{var}_raw = (',
             f'    spark.read.format("text")',
             f'    .load({s3_path_param})',
             f')',
-            f'# TODO: extract fixed-width columns using F.substring()',
         ]
+        if source_fields:
+            # Generate F.substring extractions from field widths
+            # Import here to avoid circular dependency at module level
+            try:
+                from pc_extractor.datatypes import map_type
+            except ImportError:
+                map_type = None
+
+            lines.append(f"# Extract fixed-width columns using field positions from PC metadata")
+            start = 1
+            select_parts = []
+            for fld in source_fields:
+                width = fld.length or fld.precision or 1
+                spark_type = map_type(fld.datatype, fld.precision, fld.scale) if map_type else "string"
+                select_parts.append(
+                    f'    F.substring("value", {start}, {width}).cast("{spark_type}").alias("{fld.name}")'
+                )
+                start += width
+            lines.append(f'df_{var} = df_{var}_raw.select(')
+            lines.extend(f'{p},' for p in select_parts)
+            lines.append(f')')
+        else:
+            lines += [
+                f'# TODO: extract fixed-width columns using F.substring()',
+                f'# Example: F.substring("value", 1, 10).alias("field_name")',
+                f'df_{var} = df_{var}_raw  # TODO: add F.substring column extractions',
+            ]
 
     elif db_upper in ("EXCEL",):
         s3_path_param = f"s3_input_path_{var}"
@@ -220,10 +254,16 @@ def _transformation_code(
     t: TransformationDef,
     input_var: str,
     warnings: List[str],
+    sp_strategy: str = "databricks-call",
 ) -> Tuple[List[str], str]:
     """
     Generate code lines for a single transformation.
     Returns (lines, output_var_name).
+
+    sp_strategy: how to handle STORED_PROCEDURE transformations.
+      'databricks-call'  — spark.sql("CALL schema.proc_name(...)")
+      'pyspark-udf'      — @udf skeleton
+      'jdbc-passthrough' — spark.read.jdbc(..., query="EXEC proc_name")
     """
     out_var = _safe_var(t.name)
     ttype = t.type
@@ -305,12 +345,83 @@ def _transformation_code(
 
     elif ttype == TransformationType.LOOKUP:
         cond = t.lookup_condition or ""
+        lkp_table = t.attributes.get("Lookup Table Name", "") or t.attributes.get("Lookup table name", "")
+        sql_override = t.attributes.get("Lookup Sql Override", "") or t.attributes.get("Lookup SQL Override", "")
+        lkp_var = f"lookup_df_{out_var}"
         lines += [
-            f'# LOOKUP — broadcast join pattern',
-            f'# TODO: define lookup_df (the lookup table)',
-            f'df_{out_var} = df_{input_var}.join(F.broadcast(lookup_df_{out_var}), {repr(cond) if cond else "[]"}, how="left")',
+            f'# LOOKUP — broadcast join on {lkp_table or "lookup table"}',
         ]
-        warnings.append(f"Lookup '{t.name}': define lookup_df_{out_var} and join key.")
+        if sql_override:
+            lines += [
+                f'# Lookup SQL override: {sql_override}',
+                f'{lkp_var} = spark.read.format("jdbc")  # TODO: configure JDBC options + SQL override',
+            ]
+        elif lkp_table:
+            lines += [
+                f'{lkp_var} = spark.table("{lkp_table}")  # or spark.read.jdbc(url, "{lkp_table}")',
+            ]
+        else:
+            lines += [
+                f'# TODO: define {lkp_var} — lookup table not specified in PC metadata',
+                f'{lkp_var} = None  # TODO',
+            ]
+            warnings.append(f"Lookup '{t.name}': lookup table name not found — define {lkp_var} manually.")
+        lines += [
+            f'df_{out_var} = df_{input_var}.join(F.broadcast({lkp_var}), {repr(cond) if cond else "[]"}, how="left")',
+        ]
+
+    elif ttype == TransformationType.UPDATE_STRATEGY:
+        strategy_expr = t.attributes.get("Update Strategy Expression", "DD_INSERT")
+        lines += [
+            f'# UPDATE STRATEGY — PC expression: {strategy_expr}',
+            f'# DD_INSERT=0, DD_UPDATE=1, DD_DELETE=2, DD_REJECT=3',
+            f'df_{out_var} = df_{input_var}.withColumn("_update_flag", F.lit(0))  # TODO: translate strategy expr',
+            f'',
+            f'# Split by operation — wire each to its target write below',
+            f'df_{out_var}_insert = df_{out_var}.filter(F.col("_update_flag") == 0)',
+            f'df_{out_var}_update = df_{out_var}.filter(F.col("_update_flag") == 1)',
+            f'df_{out_var}_delete = df_{out_var}.filter(F.col("_update_flag") == 2)',
+            f'df_{out_var}_reject = df_{out_var}.filter(F.col("_update_flag") == 3)',
+        ]
+        warnings.append(
+            f"Update Strategy '{t.name}': translate strategy expression '{strategy_expr}' "
+            "and wire each split DataFrame to the correct Delta write."
+        )
+
+    elif ttype == TransformationType.STORED_PROCEDURE:
+        sp_name = t.stored_proc_name or t.name
+        if sp_strategy == "databricks-call":
+            lines += [
+                f'# Stored Procedure: {sp_name}',
+                f'# Strategy: databricks-call (Unity Catalog CALL statement)',
+                f'spark.sql("CALL {sp_name}()")',
+                f'# TODO: add actual parameters to CALL above',
+                f'df_{out_var} = df_{input_var}  # passthrough after procedure call',
+            ]
+        elif sp_strategy == "pyspark-udf":
+            safe_sp = _safe_var(sp_name)
+            lines += [
+                f'# Stored Procedure: {sp_name}',
+                f'# Strategy: pyspark-udf skeleton',
+                f'@F.udf(returnType="string")  # TODO: update return type',
+                f'def {safe_sp}_udf(*args):',
+                f'    # TODO: implement logic from stored procedure {sp_name}',
+                f'    raise NotImplementedError("Implement {sp_name}")',
+                f'df_{out_var} = df_{input_var}  # TODO: apply {safe_sp}_udf to relevant columns',
+            ]
+        else:  # jdbc-passthrough
+            lines += [
+                f'# Stored Procedure: {sp_name}',
+                f'# Strategy: jdbc-passthrough',
+                f'df_{out_var} = spark.read.jdbc(',
+                f'    url=src_jdbc_url,',
+                f'    table="(EXEC {sp_name}) AS sp_result",  # TODO: add parameters',
+                f'    properties={{"user": src_user, "password": src_password}}',
+                f')',
+            ]
+        warnings.append(
+            f"Stored procedure '{sp_name}': review and test the generated {sp_strategy} code."
+        )
 
     else:
         lines += [
@@ -323,22 +434,84 @@ def _transformation_code(
 
 
 # ---------------------------------------------------------------------------
+# Merge key detection
+# ---------------------------------------------------------------------------
+
+# Patterns that suggest a primary key column name
+_PK_PATTERNS = re.compile(
+    r"\b(id|key|pk|surrogate_key|rowguid|guid|uuid)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_merge_key(target_fields: Optional[list]) -> list:
+    """
+    Auto-detect merge key columns from TargetDef.fields.
+
+    Priority:
+    1. Fields with key_type == "PRIMARY KEY"
+    2. Fields whose name ends in _ID or _KEY (word boundary)
+    3. First field named ID exactly
+    4. Empty list (caller should emit TODO)
+    """
+    if not target_fields:
+        return []
+
+    # Priority 1: explicit PRIMARY KEY
+    pk_fields = [f.name for f in target_fields if f.key_type.upper() == "PRIMARY KEY"]
+    if pk_fields:
+        return pk_fields
+
+    # Priority 2: name heuristic
+    heuristic = [
+        f.name for f in target_fields
+        if re.search(r"(_id|_key|_pk)$", f.name, re.IGNORECASE)
+    ]
+    if heuristic:
+        return heuristic[:1]  # Use first match only
+
+    # Priority 3: exact "ID"
+    for fld in target_fields:
+        if fld.name.upper() == "ID":
+            return [fld.name]
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Write cell generation
 # ---------------------------------------------------------------------------
 
 def _write_cell_code(target_name: str, db_type: str, table_name: str,
-                     load_type: str, df_var: str) -> List[str]:
-    """Generate Delta write code based on load_type."""
+                     load_type: str, df_var: str,
+                     target_fields: Optional[list] = None) -> List[str]:
+    """
+    Generate Delta write code based on load_type.
+
+    Parameters
+    ----------
+    target_fields:
+        Optional list of FieldDef objects from the folder's TargetDef.  Used
+        to auto-detect the merge key column(s) for upsert mode.
+    """
     lines: List[str] = [f"# Target: {target_name} ({db_type}) — load_type: {load_type}"]
     lt = (load_type or "insert").lower()
     tbl = table_name or target_name
 
     if lt == "upsert":
-        # Need merge keys — use the first key field or fallback
+        # Auto-detect merge key from target field definitions
+        merge_key = _detect_merge_key(target_fields)
+        if merge_key:
+            merge_cond = " AND ".join(f"t.{k} = s.{k}" for k in merge_key)
+            key_comment = f"# Merge key auto-detected from PRIMARY KEY fields: {merge_key}"
+        else:
+            merge_cond = "t.id_column = s.id_column  -- TODO: set correct merge key"
+            key_comment = '# TODO: replace "id_column" with actual merge key column(s)'
+
         lines += [
             f'target_table = f"{tbl}"',
-            f'# TODO: replace "id_column" with actual merge key column(s)',
-            f'merge_condition = "t.id_column = s.id_column"  # TODO: set correct merge key',
+            key_comment,
+            f'merge_condition = "{merge_cond}"',
             f'',
             f'DeltaTable.forName(spark, target_table).alias("t").merge(',
             f'    df_final.alias("s"),',
@@ -378,7 +551,30 @@ class DatabricksNotebookBuilder:
     Builds a Databricks Python notebook (.py format) from a MappingDef.
     """
 
-    def build(self, mapping: MappingDef) -> DatabricksNotebook:
+    def build(
+        self,
+        mapping: MappingDef,
+        folder_sources: Optional[dict] = None,
+        folder_targets: Optional[dict] = None,
+        session_params: Optional[dict] = None,
+        sp_strategy: str = "databricks-call",
+    ) -> DatabricksNotebook:
+        """
+        Build a Databricks notebook from a MappingDef.
+
+        Parameters
+        ----------
+        folder_sources:
+            Dict[name, SourceDef] from the same folder.  Provides field-width
+            metadata for FIXED_WIDTH source column extraction.
+        folder_targets:
+            Dict[name, TargetDef] from the same folder.  Provides key field
+            metadata for Delta merge key auto-detection.
+        session_params:
+            Flat dict from param-translator glue-params JSON.
+            Format: { "PARAM_NAME": {"value": ..., "type": ..., "spark_value": ...} }
+            When set, actual values replace empty-string defaults in widget declarations.
+        """
         warnings: List[str] = []
         cells: List[NotebookCell] = []
 
@@ -396,19 +592,21 @@ class DatabricksNotebookBuilder:
         cells.append(self._imports_cell())
 
         # 3. Parameters cell
-        cells.append(self._params_cell(mapping))
+        cells.append(self._params_cell(mapping, session_params=session_params))
 
         # 4. Source read cell
-        src_cell_lines, src_vars = self._source_read_cell(mapping, warnings)
+        src_cell_lines, src_vars = self._source_read_cell(
+            mapping, warnings, folder_sources=folder_sources or {}
+        )
         cells.append(NotebookCell("code", "\n".join(src_cell_lines)))
 
         # 5. Transform cell
-        transform_lines, final_var, t_warnings = self._transform_cell(mapping, src_vars)
+        transform_lines, final_var, t_warnings = self._transform_cell(mapping, src_vars, sp_strategy=sp_strategy)
         warnings += t_warnings
         cells.append(NotebookCell("code", "\n".join(transform_lines)))
 
         # 6. Write cell
-        write_lines = self._write_cell(mapping, final_var, warnings)
+        write_lines = self._write_cell(mapping, final_var, warnings, folder_targets=folder_targets or {})
         cells.append(NotebookCell("code", "\n".join(write_lines)))
 
         # 7. Summary cell
@@ -459,7 +657,12 @@ class DatabricksNotebookBuilder:
         )
         return NotebookCell("code", code.rstrip())
 
-    def _params_cell(self, mapping: MappingDef) -> NotebookCell:
+    def _params_cell(
+        self,
+        mapping: MappingDef,
+        session_params: Optional[dict] = None,
+    ) -> NotebookCell:
+        sp = session_params or {}
         lines = [
             'dbutils.widgets.text("env", "dev")',
             'dbutils.widgets.text("catalog", "main")',
@@ -468,11 +671,35 @@ class DatabricksNotebookBuilder:
         param_keys = ["env", "catalog", "schema"]
 
         # Add any mapping variables that are parameters
+        # Use actual values from session_params when available
+        already_added: set = set()
         for var in mapping.variables:
             if var.is_param:
                 safe_key = var.name.lstrip("$").lower()
-                default = var.default_value or ""
-                lines.append(f'dbutils.widgets.text("{safe_key}", "{default}")')
+                upper_key = safe_key.upper()
+                if upper_key in sp:
+                    pdata = sp[upper_key]
+                    raw = pdata.get("spark_value") or pdata.get("value") or ""
+                    ptype = pdata.get("type", "")
+                    # Strip surrounding quotes from spark_value for DATE types
+                    default = str(raw).strip('"')
+                    comment = f"  # {ptype}" if ptype else ""
+                    lines.append(f'dbutils.widgets.text("{safe_key}", "{default}"){comment}')
+                else:
+                    default = var.default_value or ""
+                    lines.append(f'dbutils.widgets.text("{safe_key}", "{default}")')
+                param_keys.append(safe_key)
+                already_added.add(upper_key)
+
+        # Add any session params not covered by mapping.variables
+        for param_name, pdata in sp.items():
+            if param_name not in already_added:
+                safe_key = param_name.lower()
+                raw = pdata.get("spark_value") or pdata.get("value") or ""
+                ptype = pdata.get("type", "")
+                default = str(raw).strip('"')
+                comment = f"  # {ptype}" if ptype else ""
+                lines.append(f'dbutils.widgets.text("{safe_key}", "{default}"){comment}')
                 param_keys.append(safe_key)
 
         keys_str = ", ".join(f'"{k}"' for k in param_keys)
@@ -480,7 +707,8 @@ class DatabricksNotebookBuilder:
         return NotebookCell("code", "\n".join(lines))
 
     def _source_read_cell(
-        self, mapping: MappingDef, warnings: List[str]
+        self, mapping: MappingDef, warnings: List[str],
+        folder_sources: Optional[dict] = None,
     ) -> Tuple[List[str], List[str]]:
         """Returns (lines, list_of_df_var_names)."""
         lines: List[str] = []
@@ -507,7 +735,10 @@ class DatabricksNotebookBuilder:
                         db_type = inst.transformation_type or db_type
                         break
 
-                src_lines = _source_read_code(t.name, db_type, table_name, sql_q)
+                # Look up source fields for FIXED_WIDTH extraction
+                src_def = (folder_sources or {}).get(t.name)
+                src_fields = src_def.fields if src_def else None
+                src_lines = _source_read_code(t.name, db_type, table_name, sql_q, source_fields=src_fields)
                 lines += src_lines
                 lines.append("")
         else:
@@ -530,7 +761,10 @@ class DatabricksNotebookBuilder:
         return lines, src_vars
 
     def _transform_cell(
-        self, mapping: MappingDef, src_vars: List[str]
+        self,
+        mapping: MappingDef,
+        src_vars: List[str],
+        sp_strategy: str = "databricks-call",
     ) -> Tuple[List[str], str, List[str]]:
         """Returns (lines, final_df_var, warnings)."""
         warnings: List[str] = []
@@ -548,7 +782,7 @@ class DatabricksNotebookBuilder:
             return lines, "final", warnings
 
         for t in non_sq:
-            t_lines, out_var = _transformation_code(t, current_var, warnings)
+            t_lines, out_var = _transformation_code(t, current_var, warnings, sp_strategy=sp_strategy)
             lines += t_lines
             lines.append("")
             current_var = out_var
@@ -557,7 +791,8 @@ class DatabricksNotebookBuilder:
         return lines, "final", warnings
 
     def _write_cell(
-        self, mapping: MappingDef, df_var: str, warnings: List[str]
+        self, mapping: MappingDef, df_var: str, warnings: List[str],
+        folder_targets: Optional[dict] = None,
     ) -> List[str]:
         lines: List[str] = []
         if not mapping.targets:
@@ -587,7 +822,10 @@ class DatabricksNotebookBuilder:
             if t.type == TransformationType.OUTPUT and t.name == tgt_name:
                 break
 
-        write_lines = _write_cell_code(tgt_name, db_type, tgt_table, load_type, df_var)
+        # Look up target fields for merge key auto-detection
+        tgt_def = (folder_targets or {}).get(tgt_name)
+        tgt_fields = tgt_def.fields if tgt_def else None
+        write_lines = _write_cell_code(tgt_name, db_type, tgt_table, load_type, df_var, target_fields=tgt_fields)
         lines += write_lines
         return lines
 

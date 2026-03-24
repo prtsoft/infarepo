@@ -96,8 +96,12 @@ def _expand_env(value: str) -> str:
     )
 
 
-def load_config(config_path: Path) -> dict:
-    """Load and parse a YAML validation config file."""
+def load_config(config_path: Path, intake: Optional[dict] = None) -> dict:
+    """Load and parse a YAML validation config file.
+
+    If intake is provided (from migration-intake.json), uses source_databases and
+    target_lakehouse entries to fill in missing DSN placeholders in the config.
+    """
     try:
         import yaml
     except ImportError:
@@ -112,6 +116,26 @@ def load_config(config_path: Path) -> dict:
     for conn_name, conn_cfg in raw.get("connections", {}).items():
         if "dsn" in conn_cfg:
             conn_cfg["dsn"] = _expand_env(conn_cfg["dsn"])
+
+    # If DSN is still a placeholder and intake provides a real value, fill it in
+    if intake:
+        conn_cfg = raw.setdefault("connections", {})
+        src_cfg  = conn_cfg.setdefault("source", {})
+        tgt_cfg  = conn_cfg.setdefault("target", {})
+
+        if not src_cfg.get("dsn") or src_cfg.get("dsn") == "mock://":
+            source_dbs = intake.get("source_databases", [])
+            if source_dbs:
+                first = source_dbs[0]
+                dsn_template = first.get("dsn_template", "")
+                if dsn_template:
+                    src_cfg["dsn"] = _expand_env(dsn_template)
+
+        if not tgt_cfg.get("dsn") or tgt_cfg.get("dsn") == "mock://":
+            lh = intake.get("target_lakehouse", {})
+            dsn_template = lh.get("dsn_template", "")
+            if dsn_template:
+                tgt_cfg["dsn"] = _expand_env(dsn_template)
 
     return raw
 
@@ -128,6 +152,7 @@ def run_validation(
     run_recon_only: bool = False,
     run_schema_only: bool = False,
     dry_run: bool = False,
+    intake: Optional[dict] = None,
 ) -> ValidationReport:
     """
     Run the full validation suite from a YAML config file.
@@ -141,7 +166,7 @@ def run_validation(
         dry_run:          Parse config and log plan but don't execute SQL.
     """
     config_path = Path(config_path)
-    config = load_config(config_path)
+    config = load_config(config_path, intake=intake)
 
     src_dsn = config.get("connections", {}).get("source", {}).get("dsn", "mock://")
     tgt_dsn = config.get("connections", {}).get("target", {}).get("dsn", "mock://")
@@ -197,7 +222,19 @@ def run_validation(
         # --- Business rules ---
         for rule_dict in val_cfg.get("rules", []):
             try:
-                result = build_and_evaluate(target_conn, tgt_table, rule_dict)
+                if rule_dict.get("type") == "distribution_check":
+                    from .rules import evaluate_distribution_check, DistributionCheckConfig
+                    cfg = DistributionCheckConfig(
+                        name=rule_dict.get("name", "distribution_check"),
+                        column=rule_dict["column"],
+                        buckets=int(rule_dict.get("buckets", 10)),
+                        tolerance_pct=float(rule_dict.get("tolerance_pct", 10.0)),
+                    )
+                    result = evaluate_distribution_check(
+                        source_conn, target_conn, src_table, tgt_table, cfg
+                    )
+                else:
+                    result = build_and_evaluate(target_conn, tgt_table, rule_dict)
                 rule_results.append(result)
             except Exception as exc:
                 log.error("Rule %r failed with error: %s", rule_dict.get("name"), exc)

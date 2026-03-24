@@ -122,8 +122,14 @@ def parse(inputs, output_dir, verbose):
 
 @cli.command()
 @click.argument("inputs", nargs=-1, required=True, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--intake", "intake_file", default=None,
+    type=click.Path(path_type=Path),
+    help="Path to migration-intake.json. When provided, HIPAA checks are enforced "
+         "only if compliance_requirements includes 'HIPAA'.",
+)
 @click.option("--verbose", "-v", is_flag=True, default=False)
-def validate(inputs, verbose):
+def validate(inputs, intake_file, verbose):
     """
     Validate .prm file(s) for common migration issues.
 
@@ -139,6 +145,13 @@ def validate(inputs, verbose):
       param-translator validate params/SALES_MART.prm
     """
     _setup_logging(verbose)
+
+    # Load intake to determine whether HIPAA checks are applicable
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from intake_loader import load_intake, is_hipaa as _is_hipaa
+    intake = load_intake(intake_file)
+    enforce_hipaa = _is_hipaa(intake) if intake else True  # default: always check
 
     _HIPAA_NAMES = re.compile(
         r"\b(PHI|PII|SSN|DOB|MRN|PATIENT|NAME|ADDRESS|PHONE|EMAIL|DOD|DOB)\b",
@@ -166,8 +179,8 @@ def validate(inputs, verbose):
                         "message": "Likely required param is empty — verify default is intentional",
                     })
 
-                # HIPAA names
-                if _HIPAA_NAMES.search(name):
+                # HIPAA names (only flagged when HIPAA is applicable)
+                if enforce_hipaa and _HIPAA_NAMES.search(name):
                     issues.append({
                         "severity": "HIPAA",
                         "file": p.name, "section": section.key, "param": name,
@@ -371,6 +384,72 @@ def show(prm_file, section, type_filter, json_output, verbose):
 
 
 import re
+
+
+# ---------------------------------------------------------------------------
+# export-ssm
+# ---------------------------------------------------------------------------
+
+@cli.command("export-ssm")
+@click.argument("inputs", nargs=-1, required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--output-dir", "-o", default="output", type=click.Path(path_type=Path),
+              show_default=True)
+@click.option("--verbose", "-v", is_flag=True, default=False)
+def export_ssm(inputs, output_dir, verbose):
+    """
+    Generate Terraform aws_ssm_parameter resources from .prm file(s).
+
+    Includes PATH params (on-prem filesystem paths) and credential-like params
+    (PASSWORD, TOKEN, SECRET, KEY, PWD, etc.) as SecureString.
+
+    Output: <output_dir>/terraform/ssm_parameters.tf
+
+    Example:
+
+      param-translator export-ssm params/SALES_MART.prm --output-dir output/
+
+      param-translator export-ssm params/ --output-dir output/
+    """
+    _setup_logging(verbose)
+    from .ssm_exporter import export_ssm_terraform
+
+    prm_paths: List[Path] = []
+    for inp in inputs:
+        p = Path(inp)
+        if p.is_dir():
+            found = sorted(p.rglob("*.prm"))
+            prm_paths.extend(found)
+        else:
+            prm_paths.append(p)
+
+    if not prm_paths:
+        click.echo("Error: no .prm files found.", err=True)
+        sys.exit(1)
+
+    prm_files = []
+    for path in prm_paths:
+        prm = parse_prm_file(path)
+        classify_file(prm)
+        normalize_file(prm)
+        prm_files.append(prm)
+        click.echo(f"  [OK] {path.name}")
+
+    out_path = export_ssm_terraform(prm_files, Path(output_dir))
+    click.echo(f"\n  SSM Terraform → {out_path}")
+
+    # Warn about HIPAA
+    hipaa_files = sum(
+        1 for prm in prm_files
+        for section in prm.sections
+        for name in section.params
+        if re.search(r"\b(PHI|PII|SSN|DOB|MRN|PATIENT)\b", name, re.IGNORECASE)
+    )
+    if hipaa_files:
+        click.echo(
+            f"\n  WARNING: {hipaa_files} HIPAA-sensitive param(s) detected. "
+            "Review SSM values before deploying.",
+            err=True,
+        )
 
 
 def main():

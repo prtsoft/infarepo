@@ -240,6 +240,10 @@ class FolderDef:
     targets: Dict[str, TargetDef] = field(default_factory=dict)
     mappings: Dict[str, MappingDef] = field(default_factory=dict)
     workflows: Dict[str, WorkflowDef] = field(default_factory=dict)
+    # Reusable transformation definitions (REUSABLE="YES") stored by name.
+    # Populated during parsing so that inline mapping instances can resolve
+    # their port definitions without requiring the full repository XML.
+    reusable_transformations: Dict[str, "TransformationDef"] = field(default_factory=dict)
 
 
 @dataclass

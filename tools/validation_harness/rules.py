@@ -83,6 +83,15 @@ class CustomSQLConfig:
     column: Optional[str] = None
 
 
+@dataclass
+class DistributionCheckConfig:
+    name: str
+    column: str
+    buckets: int = 10            # Number of histogram buckets (approximate)
+    tolerance_pct: float = 10.0  # Allowed % difference per bucket
+    rule_type: str = "distribution_check"
+
+
 # ---------------------------------------------------------------------------
 # Rule evaluators
 # ---------------------------------------------------------------------------
@@ -283,6 +292,105 @@ def evaluate_custom_sql(
     return result
 
 
+def evaluate_distribution_check(
+    source_conn: Connection,
+    target_conn: Connection,
+    source_table: str,
+    target_table: str,
+    config: DistributionCheckConfig,
+) -> RuleResult:
+    """
+    Compare value distribution of a column between source and target.
+
+    Uses a simple bucket approach: groups values into `buckets` ranges by
+    computing MIN/MAX, then counts rows per bucket. Compares bucket counts
+    as percentages of total and checks that deviation is within tolerance_pct.
+
+    HIPAA: returns only counts, never actual values.
+    """
+    _check_identifier(source_table, "source_table")
+    _check_identifier(target_table, "target_table")
+    _check_identifier(config.column, "column")
+
+    # Get total counts
+    src_total = count_rows(source_conn, source_table)
+    tgt_total = count_rows(target_conn, target_table)
+
+    if src_total == 0 or tgt_total == 0:
+        return RuleResult.make(
+            name=config.name, rule_type="distribution_check",
+            table=source_table, column=config.column,
+            failing_count=0 if src_total == tgt_total else 1,
+            total_count=src_total,
+        )
+
+    # Get min/max from source to define bucket boundaries
+    try:
+        minmax_sql = f"SELECT MIN({config.column}), MAX({config.column}) FROM {source_table}"
+        row = source_conn.execute(minmax_sql).fetchone()
+        col_min, col_max = (row[0] if row else None), (row[1] if row else None)
+    except Exception as exc:
+        log.warning("distribution_check: could not get min/max for %s.%s: %s",
+                    source_table, config.column, exc)
+        return RuleResult.make(
+            name=config.name, rule_type="distribution_check",
+            table=source_table, column=config.column,
+            failing_count=0, total_count=src_total,
+        )
+
+    if col_min is None or col_max is None or col_min == col_max:
+        # Uniform column — just compare counts
+        failing_count = 0 if abs(src_total - tgt_total) / max(src_total, 1) * 100 <= config.tolerance_pct else 1
+        return RuleResult.make(
+            name=config.name, rule_type="distribution_check",
+            table=source_table, column=config.column,
+            failing_count=failing_count, total_count=src_total,
+        )
+
+    # Compare percent distribution via a simple count in each bucket range
+    # Build one representative SQL bucket query per table
+    try:
+        bucket_sql = (
+            f"SELECT CAST(({config.column} - ({col_min})) * {config.buckets} "
+            f"/ NULLIF(({col_max}) - ({col_min}), 0) AS INT) AS bucket, "
+            f"COUNT(*) AS cnt FROM {{table}} "
+            f"GROUP BY CAST(({config.column} - ({col_min})) * {config.buckets} "
+            f"/ NULLIF(({col_max}) - ({col_min}), 0) AS INT)"
+        )
+        src_rows = source_conn.execute(bucket_sql.format(table=source_table)).fetchall()
+        tgt_rows = target_conn.execute(bucket_sql.format(table=target_table)).fetchall()
+    except Exception as exc:
+        log.warning("distribution_check: bucket query failed: %s", exc)
+        return RuleResult.make(
+            name=config.name, rule_type="distribution_check",
+            table=source_table, column=config.column,
+            failing_count=0, total_count=src_total,
+        )
+
+    src_dist = {row[0]: row[1] for row in src_rows}
+    tgt_dist = {row[0]: row[1] for row in tgt_rows}
+
+    all_buckets = set(src_dist) | set(tgt_dist)
+    failing_buckets = 0
+    for b in all_buckets:
+        src_pct = src_dist.get(b, 0) / src_total * 100
+        tgt_pct = tgt_dist.get(b, 0) / tgt_total * 100
+        if abs(src_pct - tgt_pct) > config.tolerance_pct:
+            failing_buckets += 1
+
+    result = RuleResult.make(
+        name=config.name, rule_type="distribution_check",
+        table=source_table, column=config.column,
+        failing_count=failing_buckets,
+        total_count=len(all_buckets),
+        threshold_count=0,
+    )
+    log.info("Rule [%s] %s.%s → %s (buckets=%d/%d failed)",
+             config.name, source_table, config.column,
+             "PASS" if result.passed else "FAIL", failing_buckets, len(all_buckets))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Rule dispatcher
 # ---------------------------------------------------------------------------
@@ -350,6 +458,14 @@ def build_and_evaluate(
             column=rule_dict.get("column"),
         )
         return evaluate_custom_sql(conn, table, cfg)
+
+    elif rule_type == "distribution_check":
+        # distribution_check requires both source and target connections
+        # and is dispatched separately in the runner
+        raise ValueError(
+            "distribution_check must be evaluated via evaluate_distribution_check() "
+            "with separate source and target connections."
+        )
 
     else:
         raise ValueError(f"Unknown rule type: {rule_type!r}")

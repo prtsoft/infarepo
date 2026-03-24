@@ -228,6 +228,9 @@ def _trace_field(
     if trf.type in (TransformationType.UNION, TransformationType.CUSTOM):
         return _handle_union(ctx, trf, from_inst, from_fld, depth, visited, chain)
 
+    if trf.type == TransformationType.MAPPLET:
+        return _handle_mapplet(ctx, trf, from_inst, from_fld, depth, visited, chain)
+
     # Detect unconnected lookups in expression strings (Expression, Aggregator, Filter, etc.)
     if expression:
         _detect_unconnected_lookups(ctx, expression, node)
@@ -350,6 +353,69 @@ def _handle_union(
     for inp in input_ports:
         sources.extend(_trace_field(ctx, inst, inp, depth + 1, visited, chain))
     return sources
+
+
+def _handle_mapplet(
+    ctx: _Ctx,
+    trf: TransformationDef,
+    inst: str,
+    fld: str,
+    depth: int,
+    visited: FrozenSet,
+    chain: List[LineageNode],
+) -> List[SourceRef]:
+    """
+    Mapplet traversal.
+
+    A Mapplet exposes an OUTPUT Transformation at its boundary.  To trace
+    lineage through it we need to:
+    1. Find the OUTPUT transformation port that corresponds to `fld`.
+    2. Follow internal connectors inside the mapplet back to an INPUT
+       transformation port.
+    3. The INPUT transformation port is fed by an external connector that
+       was resolved when reusable transformation resolution ran in Phase 1E.
+
+    If the reusable transformation definition was resolved (i.e. the mapplet's
+    internal connectors were inlined under the instance name), we can do a
+    full traversal.  Otherwise we log a debug message and return empty.
+    """
+    # Mapplet OUTPUT transformation ports are type OUTPUT; INPUT ports are INPUT.
+    # Build a mini connector index from this transformation's internal view:
+    # after reusable resolution, the trf.ports list contains the OUTPUT boundary
+    # ports.  The actual internal graph lives in the mapping's connector list
+    # with from_instance == inst (the mapplet instance name).
+
+    # Find which INPUT port of the mapplet feeds the OUTPUT port `fld`.
+    # Strategy: look for a FIELDDEPENDENCY entry first (populated if the
+    # reusable resolution copied it), then fall back to name matching.
+    input_ports = trf.field_dependencies.get(fld, [])
+
+    if not input_ports:
+        # Try to find an OUTPUT port with this name and match to an INPUT port
+        # by same name (common PC convention for simple pass-through mapplets)
+        output_port = next((p for p in trf.ports if p.name == fld and "OUTPUT" in p.port_type.upper()), None)
+        if output_port:
+            # Look for an INPUT port with the same base name
+            candidate = next(
+                (p.name for p in trf.ports if "INPUT" in p.port_type.upper() and p.name == fld),
+                None,
+            )
+            if candidate:
+                input_ports = [candidate]
+
+    if input_ports:
+        sources = []
+        for inp in input_ports:
+            sources.extend(_trace_field(ctx, inst, inp, depth + 1, visited, chain))
+        return sources
+
+    # Could not resolve internal mapplet graph — requires full reusable resolution
+    log.debug(
+        "MAPPLET '%s' port '%s': cannot trace internal graph — "
+        "reusable transformation not fully resolved; lineage is incomplete",
+        inst, fld,
+    )
+    return []
 
 
 def _handle_generic(
