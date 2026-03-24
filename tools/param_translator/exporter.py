@@ -126,6 +126,14 @@ def write_full_params_json(prm: PrmFile, output_dir: Path) -> Path:
 # 2. Flat glue-params JSON (one per section)
 # ---------------------------------------------------------------------------
 
+def _safe_filename(name: str) -> str:
+    """Replace characters that are invalid in file/directory names on Windows and POSIX."""
+    # Colons are the most common offender (WF:session), but also handle / \ * ? " < > |
+    for ch in r':\/|*?"<>':
+        name = name.replace(ch, "_")
+    return name
+
+
 def write_glue_params_json(prm: PrmFile, output_dir: Path) -> List[Path]:
     stem   = Path(prm.source_path).stem
     paths  = []
@@ -136,11 +144,12 @@ def write_glue_params_json(prm: PrmFile, output_dir: Path) -> List[Path]:
             folder_dir = output_dir / "glue-params" / "_global"
             filename   = f"{stem}.json"
         else:
-            folder_dir = output_dir / "glue-params" / (section.folder or "_nofolder")
+            safe_wf    = _safe_filename(section.workflow or "_nowf")
+            folder_dir = output_dir / "glue-params" / _safe_filename(section.folder or "_nofolder")
             if section.task:
-                filename = f"{section.workflow}.{section.task}.json"
+                filename = f"{safe_wf}.{_safe_filename(section.task)}.json"
             else:
-                filename = f"{section.workflow}.json"
+                filename = f"{safe_wf}.json"
 
         out = folder_dir / filename
         metadata = {
