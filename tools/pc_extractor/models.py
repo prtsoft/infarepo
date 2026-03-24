@@ -69,6 +69,9 @@ class PortDef:
     default_value: str = ""
     precision: int = 0
     scale: int = 0
+    ref_source_field: str = ""    # Normalizer: OUTPUT port's REF_SOURCE_FIELD group key
+    ref_field: str = ""           # Router: OUTPUT port's corresponding INPUT port name
+    expression_type: str = ""     # Aggregator: GROUPBY / GENERAL
 
 
 @dataclass
@@ -95,6 +98,8 @@ class TransformationDef:
     router_groups: List[RouterGroupDef] = field(default_factory=list)
     join_condition: Optional[str] = None    # JOINER condition
     join_type: Optional[str] = None         # JOINER: Normal, Master Outer, Detail Outer, Full Outer
+    field_dependencies: Dict[str, List[str]] = field(default_factory=dict)
+    # {output_field: [input_fields]} — from FIELDDEPENDENCY elements (Union/Custom)
 
 
 @dataclass
@@ -272,3 +277,56 @@ class MigrationManifest:
     repository_name: str
     folders: Dict[str, FolderDef] = field(default_factory=dict)
     summary: ExtractionSummary = field(default_factory=ExtractionSummary)
+
+
+# ---------------------------------------------------------------------------
+# Field-level lineage models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SourceRef:
+    """An ultimate source field at the end of a lineage chain."""
+    table: str        # source instance name (matches SourceDef.name)
+    field: str        # source field name
+    field_type: str = ""
+
+
+@dataclass
+class LookupRef:
+    """A lookup transformation encountered during lineage traversal."""
+    lookup_name: str
+    lookup_condition: Optional[str] = None
+    lookup_table: Optional[str] = None
+    sql_override: Optional[str] = None
+    is_connected: bool = True     # False = unconnected (:LKP.Name() in expression)
+
+
+@dataclass
+class LineageNode:
+    """One hop in a field's lineage chain."""
+    instance: str
+    field: str
+    transform_type: str
+    expression: str = ""
+    lookup_ref: Optional[LookupRef] = None
+
+
+@dataclass
+class FieldLineage:
+    """Full lineage for a single target field."""
+    target_table: str
+    target_field: str
+    sources: List[SourceRef] = field(default_factory=list)
+    chain: List[LineageNode] = field(default_factory=list)
+    expression: str = ""              # consolidated expression (first non-trivial one in chain)
+    has_unconnected_lookup: bool = False
+    lookups: List[LookupRef] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MappingLineage:
+    """All field lineage for a mapping."""
+    mapping_name: str
+    folder: str
+    fields: List[FieldLineage] = field(default_factory=list)

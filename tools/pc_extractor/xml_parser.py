@@ -154,7 +154,17 @@ def _parse_transformation(elem) -> TransformationDef:
             default_value=_attr(pf, "DEFAULTVALUE"),
             precision=_int_attr(pf, "PRECISION"),
             scale=_int_attr(pf, "SCALE"),
+            ref_source_field=_attr(pf, "REF_SOURCE_FIELD"),
+            ref_field=_attr(pf, "REF_FIELD"),
+            expression_type=_attr(pf, "EXPRESSIONTYPE"),
         ))
+
+    # --- Field dependencies (FIELDDEPENDENCY) — used by Union / Custom ---
+    for fd in elem.findall("FIELDDEPENDENCY"):
+        out_f = _attr(fd, "OUTPUTFIELD")
+        in_f = _attr(fd, "INPUTFIELD")
+        if out_f and in_f:
+            t.field_dependencies.setdefault(out_f, []).append(in_f)
 
     # --- Table Attributes (TABLEATTRIBUTE) ---
     for ta in elem.findall("TABLEATTRIBUTE"):
